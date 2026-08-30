@@ -316,6 +316,17 @@ grep -q 'TELEMETRY_LOCK' "$BIN/tunnel-lock.sh" \
   && pass "overlapping sampling passes are prevented by a lock" \
   || fail "overlapping sampling passes are prevented by a lock"
 
+SRCD="$ROOT/app/AppTunnel/Sources"
+[ -f "$SRCD/Telemetry.swift" ] \
+  && pass "Telemetry.swift exists" || fail "Telemetry.swift exists"
+nb="$(grep -c 'Band(key:' "$SRCD/Telemetry.swift" 2>/dev/null || echo 0)"
+[ "${nb:-0}" -eq 10 ] \
+  && pass "exactly ten bands are defined" \
+  || fail "exactly ten bands are defined" "found $nb"
+grep -q 'idleIsFine' "$SRCD/Telemetry.swift" 2>/dev/null \
+  && pass "the FLOW band is marked idle-is-not-failure" \
+  || fail "the FLOW band is marked idle-is-not-failure"
+
 # =============================================== argument / guard behaviour ==
 hdr "2. Guards and argument handling"
 

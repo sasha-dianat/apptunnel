@@ -59,6 +59,7 @@ final class Model {
     var socksPort: UInt16 = 1080
     /// Bundles currently running inside the tunnel's isolation group.
     var tunnelled: Set<String> = []
+    let telemetry = TelemetryStore()
     var runFile: String { stateDir + "/run-request" }
     private var scanTick = 0
     var startedAt: Date?
@@ -128,6 +129,7 @@ final class Model {
             if before != tunnelled { dirty = true }
         }
         if !demoMode && consumeEvents() { dirty = true }
+        if !demoMode && telemetry.poll() { dirty = true }
         return dirty
     }
 
