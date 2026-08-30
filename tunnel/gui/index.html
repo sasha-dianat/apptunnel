@@ -1,0 +1,605 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>APPTUNNEL</title>
+<style>
+:root{
+  --metal-hi:#5a5a6e; --metal:#3f3f4e; --metal-lo:#22222c; --metal-deep:#16161d;
+  --lcd-bg:#000; --grn:#1ee81e; --grn-dim:#0a7a0a; --amb:#e8c81e; --red:#e83a1e;
+  --title:#2a2a3a;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{
+  background:#0d0d12;
+  background-image:radial-gradient(ellipse at 50% 0%,#1e1e2b 0%,#0d0d12 70%);
+  font:12px/1.2 "Monaco","Menlo","Courier New",monospace;
+  color:#c8c8d4; display:flex; justify-content:center; padding:22px 12px 60px;
+  -webkit-font-smoothing:none;
+}
+.stack{width:552px;display:flex;flex-direction:column;gap:2px}
+
+/* ---------- window chrome ---------- */
+.win{
+  background:linear-gradient(180deg,var(--metal) 0%,var(--metal-lo) 100%);
+  border-top:1px solid var(--metal-hi); border-left:1px solid var(--metal-hi);
+  border-right:1px solid var(--metal-deep); border-bottom:1px solid var(--metal-deep);
+  box-shadow:0 2px 0 rgba(0,0,0,.5), inset 0 0 0 1px rgba(255,255,255,.03);
+  position:relative;
+}
+.tbar{
+  height:20px; display:flex; align-items:center; gap:6px; padding:0 4px;
+  background:linear-gradient(180deg,#4a4a63 0%,#2d2d3d 50%,#242433 100%);
+  border-bottom:1px solid var(--metal-deep);
+}
+.tbar .stripes{
+  flex:1; height:9px; align-self:center;
+  background:repeating-linear-gradient(180deg,#6e6e8c 0 1px,transparent 1px 3px);
+  opacity:.55;
+}
+.tbar h1{
+  font-size:10px; letter-spacing:2px; color:#b9b9d8; font-weight:700;
+  text-shadow:0 1px 0 #000; white-space:nowrap;
+}
+.tdot{width:9px;height:9px;border-radius:1px;background:#2c2c3c;
+  border-top:1px solid #6a6a86;border-left:1px solid #6a6a86;
+  border-right:1px solid #14141c;border-bottom:1px solid #14141c;}
+.tdot.live{background:var(--grn);box-shadow:0 0 6px var(--grn)}
+.tdot.warn{background:var(--amb);box-shadow:0 0 6px var(--amb)}
+.tdot.err{background:var(--red);box-shadow:0 0 6px var(--red)}
+
+/* ---------- main window ---------- */
+.main .body{display:flex;padding:6px;gap:6px}
+.mleft{width:190px;display:flex;flex-direction:column;gap:5px}
+.mright{flex:1;display:flex;flex-direction:column;gap:5px}
+
+.lcd{
+  background:var(--lcd-bg); border:1px solid var(--metal-deep);
+  box-shadow:inset 1px 1px 0 rgba(0,0,0,.9), inset -1px -1px 0 rgba(255,255,255,.06);
+  padding:5px 7px; overflow:hidden;
+}
+canvas#viz{display:block;width:176px;height:44px;image-rendering:pixelated}
+
+.bigline{display:flex;align-items:baseline;gap:8px}
+.clock{font-size:26px;line-height:1;color:var(--grn);letter-spacing:1px;
+  text-shadow:0 0 7px rgba(30,232,30,.55);font-weight:700}
+.clock.idle{color:var(--grn-dim);text-shadow:none}
+.kbps{font-size:9px;color:var(--grn-dim);letter-spacing:1px}
+
+.marquee{height:14px;overflow:hidden;position:relative;margin-top:3px}
+.marquee span{
+  position:absolute;white-space:nowrap;font-size:11px;color:var(--grn);
+  text-shadow:0 0 5px rgba(30,232,30,.4);will-change:transform;
+}
+.meta{display:flex;gap:10px;font-size:9px;color:#7d7d95;margin-top:4px;letter-spacing:.5px}
+.meta b{color:var(--grn-dim);font-weight:400}
+
+/* ---------- transport ---------- */
+.transport{display:flex;gap:2px;align-items:center}
+.btn{
+  min-width:26px;height:22px;padding:0 6px;cursor:pointer;font-size:11px;color:#d2d2e2;
+  background:linear-gradient(180deg,#4e4e63 0%,#333343 100%);
+  border-top:1px solid #7a7a9a;border-left:1px solid #7a7a9a;
+  border-right:1px solid #16161d;border-bottom:1px solid #16161d;
+  display:flex;align-items:center;justify-content:center;user-select:none;
+  font-family:inherit;
+}
+.btn:hover{background:linear-gradient(180deg,#5b5b74 0%,#3c3c4e 100%)}
+.btn:active,.btn.on{
+  background:linear-gradient(180deg,#26263a 0%,#3a3a4c 100%);
+  border-top-color:#16161d;border-left-color:#16161d;
+  border-right-color:#7a7a9a;border-bottom-color:#7a7a9a;
+}
+.btn[disabled]{opacity:.35;cursor:not-allowed}
+.btn.wide{font-size:9px;letter-spacing:1px}
+.btn.go{color:var(--grn)}
+.btn.stop{color:#ff9a8a}
+
+.sliders{display:flex;gap:6px;align-items:center;margin-top:2px}
+.slot{height:10px;flex:1;background:linear-gradient(180deg,#1a1a22,#2c2c39);
+  border:1px solid var(--metal-deep);position:relative;overflow:hidden}
+.slot i{position:absolute;left:0;top:0;bottom:0;width:0%;
+  background:linear-gradient(90deg,#0a7a0a,#1ee81e);transition:width .35s ease}
+.slot.amber i{background:linear-gradient(90deg,#7a5f0a,#e8c81e)}
+.slotlbl{font-size:8px;color:#6e6e86;letter-spacing:1px;width:34px}
+
+/* ---------- equalizer / phases ---------- */
+.eq .body{padding:7px 8px 9px}
+.phases{display:flex;gap:4px;align-items:flex-end;height:88px;
+  background:var(--lcd-bg);border:1px solid var(--metal-deep);padding:6px 6px 4px;
+  box-shadow:inset 1px 1px 0 rgba(0,0,0,.9);position:relative}
+.phases::before{
+  content:"";position:absolute;left:6px;right:6px;top:50%;height:1px;
+  background:repeating-linear-gradient(90deg,#1f3f1f 0 2px,transparent 2px 5px);
+}
+.ph{flex:1;display:flex;flex-direction:column;align-items:center;gap:3px;position:relative;z-index:1}
+.phtrack{width:9px;height:62px;background:linear-gradient(180deg,#111 0,#0a0a0a 100%);
+  border:1px solid #1c1c24;position:relative;overflow:hidden}
+.phfill{position:absolute;left:0;right:0;bottom:0;height:4%;
+  background:linear-gradient(180deg,#1ee81e,#0a7a0a);
+  transition:height .45s cubic-bezier(.2,.9,.3,1),background .3s}
+.ph.run .phfill{background:linear-gradient(180deg,#ffe14d,#e8c81e);animation:pulse .7s infinite alternate}
+.ph.fail .phfill{background:linear-gradient(180deg,#ff6a55,#a01808);height:100%!important;animation:none}
+.ph.ok .phfill{background:linear-gradient(180deg,#5cff5c,#0a7a0a)}
+@keyframes pulse{from{opacity:.45}to{opacity:1}}
+.phknob{position:absolute;left:-2px;width:13px;height:5px;
+  background:linear-gradient(180deg,#8e8eae,#3a3a4c);border:1px solid #16161d;
+  transition:bottom .45s cubic-bezier(.2,.9,.3,1)}
+.phnum{font-size:8px;color:#4d6b4d}
+.ph.ok .phnum{color:var(--grn)}
+.ph.run .phnum{color:var(--amb)}
+.ph.fail .phnum{color:var(--red)}
+.phcap{margin-top:6px;font-size:9px;color:#8a8aa2;letter-spacing:1px;height:12px;
+  display:flex;justify-content:space-between}
+.phcap em{font-style:normal;color:var(--grn-dim)}
+
+/* ---------- playlist / roster ---------- */
+.pl .body{padding:0}
+.plhead{display:flex;justify-content:space-between;align-items:center;
+  padding:4px 7px;font-size:9px;letter-spacing:1px;color:#8a8aa2;
+  border-bottom:1px solid var(--metal-deep);background:rgba(0,0,0,.25)}
+.pllist{background:#0a0a10;max-height:172px;overflow-y:auto;
+  box-shadow:inset 1px 1px 0 rgba(0,0,0,.9)}
+.row{display:flex;align-items:center;gap:8px;padding:4px 8px;font-size:11px;
+  color:var(--grn-dim);cursor:pointer;border-bottom:1px solid #12121a}
+.row:hover{background:#14141f}
+.row.on{color:var(--grn)}
+.row.sel{background:#1a2a4a;color:#cfe8ff}
+.row .idx{width:16px;color:#3d5b3d;font-size:10px;text-align:right}
+.row .nm{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.row .pth{font-size:9px;color:#4a4a5e;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;max-width:210px}
+.row .chk{width:12px;height:12px;border:1px solid #2e4a2e;background:#080810;
+  display:flex;align-items:center;justify-content:center;font-size:9px;color:var(--grn)}
+.row.on .chk{border-color:var(--grn)}
+.plfoot{display:flex;gap:2px;padding:5px 6px;border-top:1px solid var(--metal-deep);
+  background:linear-gradient(180deg,#3a3a4a,#2a2a36)}
+.empty{padding:16px;text-align:center;color:#4a4a5e;font-size:10px}
+
+/* ---------- picker modal ---------- */
+.mask{position:fixed;inset:0;background:rgba(4,4,10,.72);display:none;
+  align-items:center;justify-content:center;z-index:50;backdrop-filter:blur(2px)}
+.mask.show{display:flex}
+.picker{width:430px;max-height:78vh;display:flex;flex-direction:column}
+.picker input{width:100%;padding:6px 8px;background:#0a0a10;color:var(--grn);
+  border:1px solid var(--metal-deep);font:11px/1 inherit;outline:none}
+.picker input::placeholder{color:#3d5b3d}
+.picklist{flex:1;overflow-y:auto;background:#0a0a10;max-height:46vh;
+  border:1px solid var(--metal-deep);margin-top:6px}
+
+/* ---------- notices ---------- */
+.notice{display:flex;gap:8px;align-items:flex-start;padding:7px 9px;font-size:10px;
+  line-height:1.5;border-left:3px solid var(--amb);background:rgba(232,200,30,.07);
+  color:#d8c898;margin:6px}
+.notice.bad{border-left-color:var(--red);background:rgba(232,58,30,.08);color:#e8b0a4}
+.notice.good{border-left-color:var(--grn);background:rgba(30,232,30,.06);color:#a8d8a8}
+.notice b{color:#fff;font-weight:700}
+.notice code{background:rgba(0,0,0,.45);padding:1px 4px;color:var(--grn)}
+.hint{font-size:9px;color:#5a5a70;padding:0 8px 8px;line-height:1.6}
+::-webkit-scrollbar{width:10px}
+::-webkit-scrollbar-track{background:#0a0a10}
+::-webkit-scrollbar-thumb{background:linear-gradient(180deg,#4e4e63,#333343);
+  border:1px solid #16161d}
+</style>
+</head>
+<body>
+<div class="stack">
+
+  <!-- ============ MAIN ============ -->
+  <div class="win main">
+    <div class="tbar">
+      <span class="tdot" id="dot"></span>
+      <h1>APPTUNNEL</h1>
+      <div class="stripes"></div>
+      <span class="btn" id="btnEq" style="height:14px;min-width:18px;font-size:8px">EQ</span>
+      <span class="btn on" id="btnPl" style="height:14px;min-width:18px;font-size:8px">PL</span>
+    </div>
+    <div class="body">
+      <div class="mleft">
+        <div class="lcd"><canvas id="viz" width="176" height="44"></canvas></div>
+        <div class="transport">
+          <span class="btn" id="bPrev" title="Run diagnostics (read-only)">◄◄</span>
+          <span class="btn go" id="bPlay" title="Connect the tunnel">►</span>
+          <span class="btn" id="bDemo" title="Play the phase animation">▮▮</span>
+          <span class="btn stop" id="bStop" title="Disconnect and restore">■</span>
+          <span class="btn" id="bNext" title="Repair leftovers">►►</span>
+          <span class="btn wide" id="bAdd" title="Add an app to the tunnel">⏏ ADD</span>
+        </div>
+      </div>
+      <div class="mright">
+        <div class="lcd">
+          <div class="bigline">
+            <span class="clock idle" id="clock">--:--</span>
+            <span class="kbps" id="kbps">IDLE</span>
+          </div>
+          <div class="marquee"><span id="mq">apptunnel v2.0 &nbsp;***&nbsp; no session &nbsp;***&nbsp;</span></div>
+          <div class="meta">
+            <span>EXIT <b id="mExit">—</b></span>
+            <span>GID <b id="mGid">—</b></span>
+          </div>
+        </div>
+        <div class="sliders">
+          <span class="slotlbl">SOCKS</span>
+          <span class="slot"><i id="sSocks"></i></span>
+        </div>
+        <div class="sliders">
+          <span class="slotlbl">GUARD</span>
+          <span class="slot amber"><i id="sGuard"></i></span>
+        </div>
+      </div>
+    </div>
+    <div id="notices"></div>
+  </div>
+
+  <!-- ============ EQUALIZER = PHASES ============ -->
+  <div class="win eq" id="winEq" style="display:none">
+    <div class="tbar">
+      <span class="tdot" id="dotEq"></span>
+      <h1>CONNECTION PHASES</h1>
+      <div class="stripes"></div>
+      <span class="btn wide" id="bReplay" style="height:14px;font-size:8px">REPLAY</span>
+    </div>
+    <div class="body">
+      <div class="phases" id="phases"></div>
+      <div class="phcap"><span id="phName">READY WHEN ALL TEN BANDS ARE GREEN</span><em id="phMsg"></em></div>
+    </div>
+  </div>
+
+  <!-- ============ PLAYLIST = APP ROSTER ============ -->
+  <div class="win pl" id="winPl">
+    <div class="tbar">
+      <span class="tdot"></span>
+      <h1>TUNNEL ROSTER</h1>
+      <div class="stripes"></div>
+      <span style="font-size:9px;color:#8a8aa2" id="plCount">0/0</span>
+    </div>
+    <div class="body">
+      <div class="plhead"><span>APP</span><span>CLICK A ROW TO INCLUDE / EXCLUDE</span></div>
+      <div class="pllist" id="roster"></div>
+      <div class="plfoot">
+        <span class="btn wide" id="bAdd2">+ ADD APP</span>
+        <span class="btn wide" id="bRemove">− REMOVE</span>
+        <span class="btn wide" id="bAll">ALL</span>
+        <span class="btn wide" id="bNone">NONE</span>
+      </div>
+      <div class="hint">
+        Every enabled app is launched into <b>one shared isolation group</b>, so they all
+        sit behind the same tunnel. Apps launched later by Finder or the Dock are
+        <b>not</b> covered — start them from here.
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ APP PICKER ============ -->
+<div class="mask" id="mask">
+  <div class="win picker">
+    <div class="tbar"><span class="tdot"></span><h1>ADD APP TO TUNNEL</h1>
+      <div class="stripes"></div><span class="btn" id="pClose" style="height:14px;min-width:18px;font-size:8px">X</span></div>
+    <div class="body" style="padding:8px">
+      <input id="pSearch" placeholder="filter applications…" autocomplete="off">
+      <div class="picklist" id="picklist"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const TOKEN = "__TOKEN__";
+const api = (p, o) => fetch(`/api/${p}${p.includes('?')?'&':'?'}token=${TOKEN}`, o).then(r => r.json());
+const $ = id => document.getElementById(id);
+
+let ST = {roster: [], session: null, socks: false, leftovers: {}, system: {}};
+let PH = [];              // [{name,label,status,level}]
+let selected = null;
+let evCursor = 0, tick = 0, demo = false, t0 = null;
+
+/* ---------------- phase model ---------------- */
+const PHASE_DEFS = [
+  ["PREFLIGHT","Checking apps and tools"],
+  ["SOCKS","Reaching the SOCKS5 endpoint"],
+  ["BRIDGE","Raising the HTTP→SOCKS bridge"],
+  ["PRIV","Requesting administrator rights"],
+  ["GROUP","Creating the isolation group"],
+  ["FIREWALL","Installing group-scoped PF rules"],
+  ["CALIBRATE","Proving the leak test really works"],
+  ["LEAKTEST","Confirming zero direct egress"],
+  ["PROXYPATH","Verifying the tunnel path"],
+  ["LAUNCH","Starting the protected apps"],
+];
+
+function buildPhases(){
+  PH = PHASE_DEFS.map(([n,l]) => ({name:n, label:l, status:"idle"}));
+  const box = $("phases");
+  box.innerHTML = "";
+  PH.forEach((p,i) => {
+    const d = document.createElement("div");
+    d.className = "ph"; d.id = "ph"+i;
+    d.title = `${i+1}. ${p.name} — ${p.label}`;
+    d.innerHTML = `<div class="phtrack"><div class="phfill"></div>
+                   <div class="phknob" style="bottom:2px"></div></div>
+                   <div class="phnum">${i+1}</div>`;
+    box.appendChild(d);
+  });
+  renderPhases();
+}
+
+function setPhase(i, status, msg){
+  if(i < 0 || i >= PH.length) return;
+  PH[i].status = status;
+  if(msg) PH[i].msg = msg;
+  $("phName").textContent = `${i+1}. ${PH[i].name} — ${PH[i].label}`;
+  $("phMsg").textContent = msg || "";
+  renderPhases();
+}
+
+function renderPhases(){
+  PH.forEach((p,i) => {
+    const el = $("ph"+i); if(!el) return;
+    el.className = "ph " + (p.status === "idle" ? "" : p.status);
+    const h = p.status === "ok" ? 100 : p.status === "run" ? 55 : p.status === "fail" ? 100 : 4;
+    el.querySelector(".phfill").style.height = h + "%";
+    el.querySelector(".phknob").style.bottom = `calc(${h}% - 3px)`;
+  });
+  const done = PH.filter(p => p.status === "ok").length;
+  $("sGuard").style.width = (done/PH.length*100) + "%";
+  const failed = PH.some(p => p.status === "fail");
+  const running = PH.some(p => p.status === "run");
+  $("dotEq").className = "tdot " + (failed ? "err" : done === PH.length ? "live" : running ? "warn" : "");
+}
+
+/* ---------------- visualizer ---------------- */
+const cv = $("viz"), cx = cv.getContext("2d");
+const BANDS = 22, bars = new Array(BANDS).fill(0), peaks = new Array(BANDS).fill(0);
+function drawViz(){
+  const W = cv.width, H = cv.height;
+  cx.fillStyle = "#000"; cx.fillRect(0,0,W,H);
+  const active = PH.filter(p => p.status === "ok").length / PH.length;
+  const live = ST.session || demo;
+  const bw = Math.floor(W / BANDS);
+  for(let i = 0; i < BANDS; i++){
+    const drive = live ? (0.25 + active*0.75) : 0.05;
+    const target = live
+      ? Math.max(0, (Math.sin(tick/7 + i/2.1) * 0.4 + 0.5) * drive * (1 - i/(BANDS*1.7)) + Math.random()*0.18*drive)
+      : Math.random()*0.05;
+    bars[i] += (target - bars[i]) * 0.35;
+    peaks[i] = Math.max(peaks[i] - 0.012, bars[i]);
+    const h = Math.max(1, Math.round(bars[i] * (H-4)));
+    for(let y = 0; y < h; y += 2){
+      const f = y / (H-4);
+      cx.fillStyle = f > 0.72 ? "#e83a1e" : f > 0.45 ? "#e8c81e" : "#1ee81e";
+      cx.globalAlpha = 0.55 + f*0.45;
+      cx.fillRect(i*bw + 1, H - 2 - y, bw - 2, 1);
+    }
+    cx.globalAlpha = 1;
+    const py = H - 2 - Math.round(peaks[i]*(H-4));
+    cx.fillStyle = "#9ad8b0";
+    cx.fillRect(i*bw + 1, py, bw - 2, 1);
+  }
+  tick++;
+  requestAnimationFrame(drawViz);
+}
+drawViz();
+
+/* ---------------- marquee ---------------- */
+let mqX = 0;
+function marquee(){
+  const el = $("mq"), w = el.offsetWidth || 200;
+  mqX -= 0.5;
+  if(mqX < -w) mqX = 300;
+  el.style.transform = `translateX(${mqX}px)`;
+  requestAnimationFrame(marquee);
+}
+marquee();
+function setMarquee(t){ $("mq").textContent = `${t}  ***  `.repeat(3); }
+
+/* ---------------- clock ---------------- */
+setInterval(() => {
+  if(!t0){ $("clock").textContent = "--:--"; $("clock").classList.add("idle"); return; }
+  const s = Math.floor((Date.now() - t0)/1000);
+  $("clock").textContent = String(Math.floor(s/60)).padStart(2,"0") + ":" + String(s%60).padStart(2,"0");
+  $("clock").classList.remove("idle");
+}, 500);
+
+/* ---------------- roster ---------------- */
+function renderRoster(){
+  const box = $("roster");
+  if(!ST.roster.length){
+    box.innerHTML = `<div class="empty">Roster is empty — press <b>+ ADD APP</b></div>`;
+    $("plCount").textContent = "0/0"; return;
+  }
+  box.innerHTML = "";
+  ST.roster.forEach((a,i) => {
+    const r = document.createElement("div");
+    r.className = "row" + (a.enabled ? " on" : "") + (selected === i ? " sel" : "");
+    r.innerHTML = `<span class="idx">${i+1}.</span>
+                   <span class="chk">${a.enabled ? "✓" : ""}</span>
+                   <span class="nm">${a.name}</span>
+                   <span class="pth">${a.path}</span>`;
+    r.onclick = e => {
+      selected = i;
+      if(!e.shiftKey) a.enabled = !a.enabled;
+      saveRoster();
+    };
+    box.appendChild(r);
+  });
+  const on = ST.roster.filter(a => a.enabled).length;
+  $("plCount").textContent = `${on}/${ST.roster.length}`;
+}
+function saveRoster(){
+  api("roster", {method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({roster: ST.roster})}).then(r => {
+      if(r.roster) ST.roster = r.roster;
+      renderRoster();
+    });
+}
+
+/* ---------------- notices ---------------- */
+function renderNotices(){
+  const n = $("notices"); n.innerHTML = "";
+  const L = ST.leftovers || {};
+  const add = (cls, html) => {
+    const d = document.createElement("div");
+    d.className = "notice " + cls; d.innerHTML = html; n.appendChild(d);
+  };
+  (L.stale_proxy || []).forEach(s => {
+    if(!s.alive) add("bad", `<span>⚠</span><div><b>${s.file}</b> still points at a dead bridge
+      on port <code>${s.port}</code>. That app has <b>no network</b> until it is cleaned.
+      Press <b>►►</b> to repair.</div>`);
+  });
+  const orphanGroups = (L.groups || []).length;
+  if(orphanGroups > 2) add("", `<span>⚠</span><div><b>${orphanGroups}</b> temporary isolation groups exist.
+    Old sessions did not clean up after themselves. Press <b>►►</b> to review and repair.</div>`);
+  if(!ST.socks) add("bad", `<span>✕</span><div>Nothing is listening on <code>127.0.0.1:1080</code>.
+    Connect VeePN using <b>Shadowsocks</b> before starting the tunnel.</div>`);
+  if(!ST.session && ST.socks && !orphanGroups) add("good",
+    `<span>✓</span><div>SOCKS endpoint is up and no leftovers detected. Ready to connect.</div>`);
+}
+
+/* ---------------- state poll ---------------- */
+async function poll(){
+  try{
+    const s = await api("state");
+    ST = s;
+    $("sSocks").style.width = s.socks ? "100%" : "0%";
+    $("mExit").textContent = s.session?.exit_ip || "—";
+    $("mGid").textContent  = s.session?.gid || "—";
+    const dot = $("dot");
+    dot.className = "tdot " + (s.session ? "live" : s.socks ? "warn" : "err");
+    if(s.session){
+      if(!t0) t0 = Date.now();
+      $("kbps").textContent = "TUNNELED";
+      setMarquee(`${(s.session.apps||[]).map(p => p.split("/").pop().replace(".app","")).join(" + ")} — exit ${s.session.exit_ip}`);
+    }else if(!demo){
+      t0 = null; $("kbps").textContent = "IDLE";
+      setMarquee("apptunnel v2.0 — no session");
+    }
+    renderRoster(); renderNotices();
+  }catch(e){}
+}
+
+/* ---------------- real event stream ---------------- */
+const NAME_INDEX = {}; PHASE_DEFS.forEach(([n],i) => NAME_INDEX[n] = i);
+async function pollEvents(){
+  try{
+    const r = await api(`events?since=${evCursor}`);
+    evCursor = r.since;
+    r.events.forEach(ev => {
+      if(ev.name === "READY"){ PH.forEach((p,i) => setPhase(i,"ok")); $("kbps").textContent = "TUNNELED"; return; }
+      const i = NAME_INDEX[ev.name];
+      if(i === undefined) return;
+      if(ev.status === "run" && !t0) t0 = Date.now();
+      setPhase(i, ev.status === "ok" ? "ok" : ev.status === "fail" ? "fail" : "run", ev.msg);
+    });
+  }catch(e){}
+}
+
+/* ---------------- demo animation ---------------- */
+async function runDemo(){
+  if(demo) return;
+  demo = true; t0 = Date.now(); evCursor = 1e9;
+  $("winEq").style.display = ""; $("btnEq").classList.add("on");
+  buildPhases();
+  const SAMPLE = [
+    "3 app(s): Claude, ChatGPT, Codex",
+    "tunnel exit IP 91.207.57.102",
+    "bridge http://127.0.0.1:54871 verified",
+    "sudo acquired, keepalive active",
+    "group apptun4821 (gid=57321)",
+    "2 rules per link on en0, bridge0",
+    "control probe reached 5/5 targets — test is meaningful",
+    "0/5 targets reachable directly — guard is enforcing",
+    "tunnel path verified at 91.207.57.102",
+    "3 app(s) running inside the tunnel",
+  ];
+  $("kbps").textContent = "CONNECTING";
+  for(let i = 0; i < PH.length; i++){
+    setPhase(i, "run");
+    setMarquee(`PHASE ${i+1}/10 — ${PH[i].label}`);
+    await new Promise(r => setTimeout(r, 620 + Math.random()*380));
+    setPhase(i, "ok", SAMPLE[i]);
+    await new Promise(r => setTimeout(r, 130));
+  }
+  $("kbps").textContent = "TUNNELED (DEMO)";
+  setMarquee("DEMO — all ten phases green, apps would now be safe to use");
+  $("phName").textContent = "READY — every band green, apps are inside the tunnel";
+  $("phMsg").textContent = "demo";
+  setTimeout(() => { demo = false; t0 = null; evCursor = 0; }, 6000);
+}
+
+/* ---------------- picker ---------------- */
+let allApps = [];
+async function openPicker(){
+  $("mask").classList.add("show"); $("pSearch").value = ""; $("pSearch").focus();
+  $("picklist").innerHTML = `<div class="empty">scanning…</div>`;
+  const r = await api("scan"); allApps = r.apps || [];
+  drawPicker("");
+}
+function drawPicker(q){
+  const have = new Set(ST.roster.map(a => a.path));
+  const list = allApps.filter(a => a.name.toLowerCase().includes(q.toLowerCase()));
+  $("picklist").innerHTML = list.length ? "" : `<div class="empty">no match</div>`;
+  list.forEach(a => {
+    const r = document.createElement("div");
+    r.className = "row" + (have.has(a.path) ? " on" : "");
+    r.innerHTML = `<span class="chk">${have.has(a.path) ? "✓" : "+"}</span>
+                   <span class="nm">${a.name}</span><span class="pth">${a.path}</span>`;
+    r.onclick = () => {
+      if(have.has(a.path)) return;
+      ST.roster.push({path:a.path, name:a.name, enabled:true});
+      saveRoster(); $("mask").classList.remove("show");
+    };
+    $("picklist").appendChild(r);
+  });
+}
+
+/* ---------------- buttons ---------------- */
+$("bPlay").onclick = async () => {
+  if(!ST.socks && !confirm("No SOCKS5 proxy detected on 127.0.0.1:1080.\nStart anyway?")) return;
+  buildPhases(); evCursor = 0; t0 = Date.now();
+  $("winEq").style.display = ""; $("btnEq").classList.add("on");
+  $("kbps").textContent = "CONNECTING";
+  const r = await api("start", {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}"});
+  if(r.error){ alert(r.error); $("kbps").textContent = "IDLE"; t0 = null; }
+  else setMarquee("a Terminal window opened — enter your password there when asked");
+};
+$("bStop").onclick = async () => {
+  const r = await api("stop", {method:"POST", body:"{}"});
+  if(r.error) alert(r.error); else setMarquee("disconnecting and restoring system state…");
+};
+$("bPrev").onclick = () => api("doctor", {method:"POST", headers:{"Content-Type":"application/json"},
+  body: JSON.stringify({fix:false})});
+$("bNext").onclick = () => {
+  if(confirm("Repair leftovers?\n\nThis removes orphaned isolation groups, dead bridges,\nstale PF anchors and dead proxy entries.\n\nIt does NOT touch DHCP, DNS or any network service."))
+    api("doctor", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({fix:true})});
+};
+$("bDemo").onclick = runDemo;
+$("bReplay").onclick = runDemo;
+$("bAdd").onclick = openPicker;
+$("bAdd2").onclick = openPicker;
+$("bRemove").onclick = () => {
+  if(selected === null) return alert("Select a row first.");
+  ST.roster.splice(selected,1); selected = null; saveRoster();
+};
+$("bAll").onclick  = () => { ST.roster.forEach(a => a.enabled = true);  saveRoster(); };
+$("bNone").onclick = () => { ST.roster.forEach(a => a.enabled = false); saveRoster(); };
+$("pClose").onclick = () => $("mask").classList.remove("show");
+$("mask").onclick = e => { if(e.target === $("mask")) $("mask").classList.remove("show"); };
+$("pSearch").oninput = e => drawPicker(e.target.value);
+$("btnEq").onclick = () => {
+  const w = $("winEq"), on = w.style.display === "none";
+  w.style.display = on ? "" : "none"; $("btnEq").classList.toggle("on", on);
+};
+$("btnPl").onclick = () => {
+  const w = $("winPl"), on = w.style.display === "none";
+  w.style.display = on ? "" : "none"; $("btnPl").classList.toggle("on", on);
+};
+
+/* ---------------- go ---------------- */
+buildPhases();
+poll(); setInterval(poll, 2000);
+setInterval(() => { if(!demo) pollEvents(); }, 400);
+</script>
+</body>
+</html>

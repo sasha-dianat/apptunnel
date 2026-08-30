@@ -1,0 +1,257 @@
+#!/bin/bash
+# tunnel-doctor.sh — diagnose and clean up leftovers from tunnel launcher runs.
+#
+# Default mode is READ ONLY: it reports, it changes nothing.
+# Pass --fix to remove orphans.
+#
+# It never touches DHCP, DNS servers, network service order, Wi-Fi, or the
+# system proxy configuration. It only removes things the launchers created:
+#   - temporary isolation groups (apptun*/cldesk*/cgptvpn*, gid 57000-57999)
+#   - PF anchors created by the launchers
+#   - orphaned http_to_socks.py bridge processes
+#   - stale proxy keys in ~/.claude/settings.json and ~/.codex/.env
+
+set -uo pipefail
+
+FIX=0
+[ "${1:-}" = "--fix" ] && FIX=1
+[ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ] && { sed -n '2,15p' "$0"; exit 0; }
+
+LOGIN_USER="$(id -un)"
+STATE_FILE="$HOME/.apptunnel/session.json"
+
+# Liveness must be tested with ps, not `kill -0`. Sending even signal 0 to a
+# process outside the caller's own session fails under a sandboxed shell, which
+# made this script report live bridges and sessions as orphans.
+alive() { [ -n "${1:-}" ] && ps -p "$1" >/dev/null 2>&1; }
+PROBLEMS=0
+CYA=$'\033[36m'; GRN=$'\033[32m'; YEL=$'\033[33m'; RED=$'\033[31m'; DIM=$'\033[2m'; OFF=$'\033[0m'
+
+hdr()  { printf '\n%s== %s ==%s\n' "$CYA" "$1" "$OFF"; }
+good() { printf '   %sok%s   %s\n' "$GRN" "$OFF" "$1"; }
+warn() { printf '   %s!!%s   %s\n' "$YEL" "$OFF" "$1"; PROBLEMS=$((PROBLEMS+1)); }
+bad()  { printf '   %sXX%s   %s\n' "$RED" "$OFF" "$1"; PROBLEMS=$((PROBLEMS+1)); }
+act()  { printf '   %s->%s   %s\n' "$DIM" "$OFF" "$1"; }
+
+printf '%stunnel-doctor%s  %s\n' "$CYA" "$OFF" "$( [ "$FIX" = 1 ] && echo 'MODE: FIX' || echo 'MODE: read-only (pass --fix to repair)')"
+
+# ------------------------------------------------------------ live session --
+hdr "Active session"
+LIVE_PID=""
+if [ -f "$STATE_FILE" ]; then
+  LIVE_PID="$(/usr/bin/python3 -c 'import json,sys
+try: print(json.load(open(sys.argv[1])).get("pid",""))
+except Exception: pass' "$STATE_FILE" 2>/dev/null)"
+fi
+if alive "$LIVE_PID"; then
+  good "tunnel-lock.sh running (pid $LIVE_PID) - its resources will be left alone"
+else
+  LIVE_PID=""
+  # Legacy scripts kept no state file; detect them by command line.
+  # Match only a shell *running* a launcher script - not shells that merely
+  # mention one (this doctor's own invocation would otherwise match itself).
+  legacy="$(ps -axo pid=,command= | awk -v self="$$" '
+      $1 != self &&
+      $0 ~ /\/bin\/(ba)?sh .*(veepn-shadowsocks-lock|tunnel-lock).*\.sh/ &&
+      $0 !~ /(ba)?sh -c/ {print}' || true)"
+  if [ -n "$legacy" ]; then
+    printf '%s\n' "$legacy" | while IFS= read -r l; do good "launcher running: $l"; done
+    LIVE_PID="$(printf '%s\n' "$legacy" | awk '{print $1}' | head -1)"
+  else
+    good "no launcher session running"
+  fi
+fi
+
+LIVE_GID=""
+[ -n "$LIVE_PID" ] && LIVE_GID="$(ps -o gid= -p "$LIVE_PID" 2>/dev/null | awk '{print $1}')"
+
+# ------------------------------------------------------- orphaned groups ----
+hdr "Temporary isolation groups"
+ORPHAN_GROUPS=()
+while IFS= read -r line; do
+  [ -n "$line" ] || continue
+  gname="$(printf '%s' "$line" | awk '{print $1}')"
+  ggid="$(printf '%s' "$line" | awk '{print $2}')"
+  case "$gname" in apptun*|cldesk*|cgptvpn*) ;; *) continue ;; esac
+  # Is any live process still using this gid?
+  users="$(ps -axo gid= | awk -v g="$ggid" '$1==g' | wc -l | tr -d ' ')"
+  if [ "$ggid" = "$LIVE_GID" ] || [ "${users:-0}" -gt 0 ]; then
+    good "$gname (gid $ggid) in use by $users process(es) - keeping"
+  else
+    bad "$gname (gid $ggid) orphaned - no process uses it"
+    ORPHAN_GROUPS+=("$gname")
+  fi
+done < <(dscl . -list /Groups PrimaryGroupID 2>/dev/null | awk '$2>=57000 && $2<58000')
+[ "${#ORPHAN_GROUPS[@]}" -eq 0 ] && good "no orphaned groups"
+
+if [ "$FIX" = 1 ] && [ "${#ORPHAN_GROUPS[@]}" -gt 0 ]; then
+  for g in "${ORPHAN_GROUPS[@]}"; do
+    act "removing group $g"
+    sudo /usr/sbin/dseditgroup -o edit -d "$LOGIN_USER" -t user "$g" >/dev/null 2>&1
+    sudo /usr/sbin/dseditgroup -o delete "$g" >/dev/null 2>&1 && good "deleted $g" || bad "could not delete $g"
+  done
+fi
+
+# --------------------------------------------------------- orphaned bridges -
+hdr "HTTP->SOCKS bridge processes"
+ORPHAN_BRIDGES=()
+while IFS= read -r line; do
+  [ -n "$line" ] || continue
+  bpid="$(printf '%s' "$line" | awk '{print $1}')"
+  bppid="$(ps -o ppid= -p "$bpid" 2>/dev/null | awk '{print $1}')"
+  if alive "$bppid" && [ "$bppid" != "1" ]; then
+    good "bridge pid $bpid owned by live launcher pid $bppid - keeping"
+  else
+    bad "bridge pid $bpid orphaned (parent gone)"
+    ORPHAN_BRIDGES+=("$bpid")
+  fi
+done < <(ps -axo pid=,command= | grep 'http_to_socks.py' | grep -v grep)
+[ "${#ORPHAN_BRIDGES[@]}" -eq 0 ] && good "no orphaned bridges"
+
+if [ "$FIX" = 1 ] && [ "${#ORPHAN_BRIDGES[@]}" -gt 0 ]; then
+  for b in "${ORPHAN_BRIDGES[@]}"; do
+    act "killing orphaned bridge $b"
+    kill -TERM "$b" 2>/dev/null; sleep 0.3; kill -KILL "$b" 2>/dev/null
+    alive "$b" && bad "bridge $b survived" || good "bridge $b stopped"
+  done
+fi
+
+# --------------------------------------------------------------- PF state ---
+hdr "Packet filter"
+if sudo -n true 2>/dev/null; then
+  PFSUDO="sudo -n"
+elif [ "$FIX" = 1 ]; then
+  sudo -v && PFSUDO="sudo" || PFSUDO=""
+else
+  PFSUDO=""
+fi
+
+if [ -z "$PFSUDO" ]; then
+  warn "PF state needs root to inspect. Run: sudo pfctl -s Anchors -v"
+  warn "and check for machine-wide DNS blocks: sudo pfctl -sr | grep 'port = 53'"
+else
+  if $PFSUDO pfctl -s info 2>/dev/null | grep -q 'Status: Enabled'; then
+    good "PF is enabled"
+  else
+    good "PF is disabled (no launcher rules can be in effect)"
+  fi
+  if $PFSUDO pfctl -s rules 2>/dev/null | grep -q 'anchor "com.apple/\*"'; then
+    good 'main ruleset references com.apple/* (anchors are evaluated)'
+  else
+    bad 'main ruleset is missing anchor "com.apple/*" - loaded anchors do NOTHING'
+    act 'repair with: sudo pfctl -f /etc/pf.conf'
+  fi
+  anchors="$($PFSUDO pfctl -a com.apple -s Anchors 2>/dev/null | grep -Ei 'apptunnel|cldesktop-vpn|chatgpt-codex-vpn' || true)"
+  if [ -n "$anchors" ]; then
+    printf '%s\n' "$anchors" | while IFS= read -r a; do printf '   found anchor: %s\n' "$a"; done
+    for a in $anchors; do
+      full="com.apple/$(basename "$a")"
+      rules="$($PFSUDO pfctl -a "$full" -s rules 2>/dev/null || true)"
+      [ -z "$rules" ] && { good "$full is empty"; continue; }
+      # A port-53/853 rule WITHOUT a `group` clause blocks DNS for the whole
+      # Mac, not just the guarded apps. Group-scoped rules are legitimate.
+      if printf '%s\n' "$rules" | grep -E 'port = (53|853)' | grep -qv 'group'; then
+        bad "$full has a MACHINE-WIDE DNS block - this is what kills your Internet"
+        act "disarm with: \"$(dirname "$0")/tunnel-dnsguard.sh\" --fix"
+      else
+        warn "$full still holds rules"
+      fi
+      if [ "$FIX" = 1 ] && [ "$full" != "com.apple/apptunnel" -o -z "$LIVE_PID" ]; then
+        act "flushing $full"
+        $PFSUDO pfctl -a "$full" -F rules >/dev/null 2>&1 && good "flushed $full" || bad "could not flush $full"
+      fi
+    done
+  else
+    good "no launcher PF anchors present"
+  fi
+fi
+
+# ------------------------------------------------------ stale app proxy cfg -
+hdr "Leftover proxy configuration"
+check_proxy_file() {
+  local label="$1" port="$2"
+  [ -n "$port" ] || return 0
+  if nc -z -w 2 127.0.0.1 "$port" >/dev/null 2>&1; then
+    warn "$label points at 127.0.0.1:$port (alive, but it dies with the session)"
+  else
+    bad "$label points at 127.0.0.1:$port which is DEAD - that app has no network"
+  fi
+}
+
+CLAUDE_PORT="$(/usr/bin/python3 -c '
+import json,os,re
+p=os.path.expanduser("~/.claude/settings.json")
+try:
+    v=json.load(open(p)).get("env",{}).get("HTTP_PROXY","")
+except Exception:
+    v=""
+m=re.search(r":(\d+)",v); print(m.group(1) if m else "")' 2>/dev/null)"
+if [ -n "$CLAUDE_PORT" ]; then
+  check_proxy_file "~/.claude/settings.json" "$CLAUDE_PORT"
+else
+  good "~/.claude/settings.json has no proxy override"
+fi
+
+CODEX_PORT="$(/usr/bin/python3 -c '
+import os,re
+p=os.path.expanduser("~/.codex/.env")
+try: t=open(p,encoding="utf-8").read()
+except Exception: t=""
+m=re.search(r"^HTTP_PROXY=.*?:(\d+)",t,re.M); print(m.group(1) if m else "")' 2>/dev/null)"
+if [ -n "$CODEX_PORT" ]; then
+  check_proxy_file "~/.codex/.env" "$CODEX_PORT"
+else
+  good "~/.codex/.env has no proxy override"
+fi
+
+if [ "$FIX" = 1 ] && [ -z "$LIVE_PID" ]; then
+  if [ -n "$CLAUDE_PORT" ]; then
+    act "removing proxy keys from ~/.claude/settings.json (backup: .bak)"
+    /usr/bin/python3 -c '
+import json,os,shutil
+p=os.path.expanduser("~/.claude/settings.json")
+shutil.copy2(p,p+".bak")
+d=json.load(open(p)); e=d.get("env",{})
+for k in ("HTTP_PROXY","HTTPS_PROXY","http_proxy","https_proxy","NO_PROXY","no_proxy"):
+    e.pop(k,None)
+if not e: d.pop("env",None)
+json.dump(d,open(p,"w"),indent=2); open(p,"a").write("\n")
+print("cleaned")' && good "settings.json cleaned" || bad "could not clean settings.json"
+  fi
+  if [ -n "$CODEX_PORT" ]; then
+    act "removing proxy keys from ~/.codex/.env (backup: .bak)"
+    /usr/bin/python3 -c '
+import os,re,shutil
+p=os.path.expanduser("~/.codex/.env")
+shutil.copy2(p,p+".bak")
+keys={"HTTP_PROXY","HTTPS_PROXY","http_proxy","https_proxy","NO_PROXY","no_proxy","ALL_PROXY","all_proxy"}
+pat=re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=")
+out=[]
+for line in open(p,encoding="utf-8"):
+    if line.startswith("# Temporary VeePN") or line.startswith("# apptunnel"): continue
+    m=pat.match(line)
+    if m and m.group(1) in keys: continue
+    out.append(line)
+while out and not out[0].strip(): out.pop(0)
+open(p,"w",encoding="utf-8").writelines(out)
+print("cleaned")' && good ".codex/.env cleaned" || bad "could not clean .codex/.env"
+  fi
+fi
+
+# ------------------------------------------------------- untouched by us ----
+hdr "System network settings (read-only check - never modified by these tools)"
+sys_socks="$(scutil --proxy 2>/dev/null | awk '/SOCKSEnable/{e=$3}/SOCKSProxy /{h=$3}/SOCKSPort/{p=$3}END{print (e=="1"? h":"p : "disabled")}')"
+good "system SOCKS proxy: $sys_socks"
+good "DNS servers: $(scutil --dns 2>/dev/null | awk '/nameserver\[0\]/{print $3; exit}')"
+good "default route: $(route -n get default 2>/dev/null | awk '/gateway/{print $2}')"
+printf '   %sThese tools only read the above. DHCP and network services are never changed.%s\n' "$DIM" "$OFF"
+
+hdr "Summary"
+if [ "$PROBLEMS" -eq 0 ]; then
+  printf '   %sClean. Nothing left behind.%s\n\n' "$GRN" "$OFF"
+elif [ "$FIX" = 1 ]; then
+  printf '   %s%s issue(s) processed. Re-run to confirm.%s\n\n' "$YEL" "$PROBLEMS" "$OFF"
+else
+  printf '   %s%s issue(s) found. Re-run with --fix to repair.%s\n\n' "$YEL" "$PROBLEMS" "$OFF"
+fi
+exit 0

@@ -1,0 +1,277 @@
+#!/bin/bash
+#
+# One-click supervisor for the already-tested Claude + ChatGPT/Codex
+# VeePN Shadowsocks fail-closed launchers.
+#
+# It deliberately does NOT replace either underlying protection script.
+# Instead it:
+#   * asks for VeePN confirmation once,
+#   * authenticates sudo once,
+#   * holds a shared PF enable reference when PF was initially disabled,
+#   * starts both protection scripts non-interactively,
+#   * keeps PF alive until BOTH protected sessions finish,
+#   * shows a combined ready/failure status.
+#
+
+set -u
+
+CLAUDE="/Applications/Claude-Chatgpt Tunnel/claude-desktop-veepn-shadowsocks-lock-v5.4.sh"
+CHATGPT="/Applications/Claude-Chatgpt Tunnel/chatgpt-codex-veepn-shadowsocks-lock-v1.1.sh"
+
+LOG_DIR="$HOME/Library/Logs/VeePN-Protected-Launchers"
+STAMP="$(date '+%Y%m%d-%H%M%S')"
+CLAUDE_LOG="$LOG_DIR/claude-$STAMP.log"
+CHATGPT_LOG="$LOG_DIR/chatgpt-codex-$STAMP.log"
+
+CLAUDE_PID=""
+CHATGPT_PID=""
+PF_TOKEN=""
+PF_OWNED=0
+CLEANING=0
+
+log() {
+  printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*"
+}
+
+pause_on_error() {
+  echo
+  read -r -p "Press Return to close..." _unused
+}
+
+die() {
+  echo
+  echo "ERROR: $*" >&2
+  pause_on_error
+  exit 1
+}
+
+pid_alive() {
+  local p="${1:-}"
+  [ -n "$p" ] && kill -0 "$p" 2>/dev/null
+}
+
+cleanup() {
+  local rc=$?
+  [ "$CLEANING" -eq 0 ] || exit "$rc"
+  CLEANING=1
+
+  # If this supervisor is interrupted, stop both child launchers first so each
+  # one can remove its PF anchor/group/proxy modifications before we release
+  # the shared PF reference.
+  if pid_alive "$CLAUDE_PID"; then
+    kill -TERM "$CLAUDE_PID" 2>/dev/null || true
+  fi
+  if pid_alive "$CHATGPT_PID"; then
+    kill -TERM "$CHATGPT_PID" 2>/dev/null || true
+  fi
+
+  [ -z "$CLAUDE_PID" ] || wait "$CLAUDE_PID" 2>/dev/null || true
+  [ -z "$CHATGPT_PID" ] || wait "$CHATGPT_PID" 2>/dev/null || true
+
+  if [ "$PF_OWNED" -eq 1 ]; then
+    log "Releasing shared PF reference."
+    if [ -n "$PF_TOKEN" ]; then
+      sudo -n pfctl -X "$PF_TOKEN" >/dev/null 2>&1 || true
+    fi
+  fi
+
+  exit "$rc"
+}
+trap cleanup EXIT INT TERM HUP
+
+clear
+cat <<'EOF'
+======================================================================
+       CLAUDE + CHATGPT/CODEX — VeePN SHADOWSOCKS PROTECTED
+======================================================================
+
+This one launcher starts BOTH protected desktop sessions.
+
+Required:
+  • VeePN is connected
+  • VeePN protocol is Shadowsocks
+  • Keep this Terminal window open while either protected app is running
+
+Do NOT authorize sudo/root networking from Claude or Codex.
+EOF
+
+[ -f "$CLAUDE" ] || die "Claude protection script not found:
+  $CLAUDE"
+[ -f "$CHATGPT" ] || die "ChatGPT/Codex protection script not found:
+  $CHATGPT"
+
+chmod +x "$CLAUDE" "$CHATGPT" 2>/dev/null || \
+  die "Could not make the underlying protection scripts executable."
+
+# Verify the VeePN system SOCKS endpoint before asking for sudo.
+proxy_dump="$(/usr/sbin/scutil --proxy 2>/dev/null || true)"
+socks_enable="$(printf '%s\n' "$proxy_dump" | awk '/SOCKSEnable[[:space:]]*:/ {print $3; exit}')"
+socks_host="$(printf '%s\n' "$proxy_dump" | awk '/SOCKSProxy[[:space:]]*:/ {print $3; exit}')"
+socks_port="$(printf '%s\n' "$proxy_dump" | awk '/SOCKSPort[[:space:]]*:/ {print $3; exit}')"
+
+if [ "$socks_enable" != "1" ] || \
+   [ "$socks_host" != "127.0.0.1" ] || \
+   [ "$socks_port" != "1080" ]; then
+  die "VeePN Shadowsocks is not detected at 127.0.0.1:1080.
+
+Connect VeePN using Shadowsocks, then double-click this launcher again."
+fi
+
+echo
+read -r -p "Type YES once to launch BOTH protected apps: " answer
+[ "$answer" = "YES" ] || die "Confirmation not received."
+
+mkdir -p "$LOG_DIR"
+
+echo
+log "VeePN system SOCKS verified at 127.0.0.1:1080."
+log "Authenticating sudo once for both protection scripts."
+sudo -v || die "sudo authentication failed."
+
+# Keep sudo credentials refreshed while this supervisor lives. This prevents
+# either child from prompting independently later during cleanup.
+(
+  while true; do
+    sleep 45
+    sudo -n -v >/dev/null 2>&1 || exit 0
+  done
+) &
+SUDO_KEEPALIVE_PID=$!
+
+# If PF was initially disabled, this supervisor—not either child—takes the
+# enable reference. Both children will then see PF already enabled and will
+# never own/disable the global PF state independently.
+if ! sudo pfctl -s info 2>/dev/null | grep -q 'Status: Enabled'; then
+  enable_out="$(sudo pfctl -E 2>&1 || true)"
+  PF_TOKEN="$(printf '%s\n' "$enable_out" | awk '/Token[[:space:]]*:/ {print $NF; exit}')"
+  [ -n "$PF_TOKEN" ] || die "Could not obtain a PF reference token."
+  PF_OWNED=1
+  log "PF was disabled; supervisor now holds the shared PF reference."
+else
+  log "PF was already enabled; existing PF state will be left untouched."
+fi
+
+log "Starting protected Claude."
+/bin/bash "$CLAUDE" </dev/null >"$CLAUDE_LOG" 2>&1 &
+CLAUDE_PID=$!
+
+# Stagger startup slightly so temporary group creation/PF-anchor loading and
+# cached sudo operations don't collide unnecessarily.
+sleep 1
+
+log "Starting protected ChatGPT/Codex."
+/bin/bash "$CHATGPT" </dev/null >"$CHATGPT_LOG" 2>&1 &
+CHATGPT_PID=$!
+
+echo
+echo "Protection logs:"
+echo "  Claude       : $CLAUDE_LOG"
+echo "  ChatGPT/Codex: $CHATGPT_LOG"
+echo
+
+CLAUDE_READY=0
+CHATGPT_READY=0
+CLAUDE_REPORTED=0
+CHATGPT_REPORTED=0
+
+# Wait until each launcher either proves protection or exits with an error.
+while true; do
+  if [ "$CLAUDE_READY" -eq 0 ] && \
+     grep -q 'PASS: Claude Desktop main process and visible descendants are inside the isolation group.' \
+       "$CLAUDE_LOG" 2>/dev/null; then
+    CLAUDE_READY=1
+    log "✓ Claude protection verified."
+  fi
+
+  if [ "$CHATGPT_READY" -eq 0 ] && \
+     grep -q 'visible bundle helpers are inside the isolation group.' \
+       "$CHATGPT_LOG" 2>/dev/null; then
+    CHATGPT_READY=1
+    log "✓ ChatGPT/Codex protection verified."
+  fi
+
+  if [ "$CLAUDE_READY" -eq 0 ] && ! pid_alive "$CLAUDE_PID"; then
+    echo
+    echo "Claude protection launcher exited before reaching READY."
+    echo "---- last Claude log lines ----"
+    tail -35 "$CLAUDE_LOG" 2>/dev/null || true
+    echo "-------------------------------"
+    die "Claude protected launch failed."
+  fi
+
+  if [ "$CHATGPT_READY" -eq 0 ] && ! pid_alive "$CHATGPT_PID"; then
+    echo
+    echo "ChatGPT/Codex protection launcher exited before reaching READY."
+    echo "---- last ChatGPT/Codex log lines ----"
+    tail -35 "$CHATGPT_LOG" 2>/dev/null || true
+    echo "-------------------------------------"
+    die "ChatGPT/Codex protected launch failed."
+  fi
+
+  if [ "$CLAUDE_READY" -eq 1 ] && [ "$CHATGPT_READY" -eq 1 ]; then
+    break
+  fi
+
+  sleep 1
+done
+
+cat <<'EOF'
+
+======================================================================
+                 BOTH APPS ARE FAIL-CLOSED PROTECTED
+======================================================================
+
+Claude and ChatGPT/Codex are now running through their respective:
+  localhost bridge -> VeePN SOCKS5 -> VeePN Shadowsocks paths.
+
+Their direct protected-process egress is blocked by PF.
+
+You may use either or both apps.
+You can quit them in any order.
+
+IMPORTANT:
+  Keep THIS Terminal window open until you are finished with BOTH apps.
+  The shared PF reference stays alive until both protected launchers exit.
+======================================================================
+
+EOF
+
+# Wait for both. If one exits first, explicitly tell the user that the other
+# remains protected because this supervisor still owns the shared PF lifetime.
+CLAUDE_DONE=0
+CHATGPT_DONE=0
+
+while [ "$CLAUDE_DONE" -eq 0 ] || [ "$CHATGPT_DONE" -eq 0 ]; do
+  if [ "$CLAUDE_DONE" -eq 0 ] && ! pid_alive "$CLAUDE_PID"; then
+    wait "$CLAUDE_PID" 2>/dev/null
+    CLAUDE_RC=$?
+    CLAUDE_DONE=1
+    log "Claude protected session ended (status $CLAUDE_RC)."
+    if [ "$CHATGPT_DONE" -eq 0 ]; then
+      log "ChatGPT/Codex remains protected; shared PF is still held."
+    fi
+  fi
+
+  if [ "$CHATGPT_DONE" -eq 0 ] && ! pid_alive "$CHATGPT_PID"; then
+    wait "$CHATGPT_PID" 2>/dev/null
+    CHATGPT_RC=$?
+    CHATGPT_DONE=1
+    log "ChatGPT/Codex protected session ended (status $CHATGPT_RC)."
+    if [ "$CLAUDE_DONE" -eq 0 ]; then
+      log "Claude remains protected; shared PF is still held."
+    fi
+  fi
+
+  sleep 1
+done
+
+# Stop sudo keepalive before normal cleanup.
+kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+wait "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+
+echo
+log "Both protected sessions have ended."
+log "Child launchers have restored their temporary proxy/group/PF-anchor changes."
+
+# cleanup trap releases our shared PF reference if we own one.
+exit 0

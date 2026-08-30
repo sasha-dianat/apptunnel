@@ -1,0 +1,12 @@
+# Build output — rebuilt by tunnel/app/build.sh
+AppTunnel.app/
+tunnel/app/AppTunnel.app/
+
+# Rolling backups the scripts make
+*.bak
+*.prev
+*.prev2
+*.prev3
+
+# macOS
+.DS_Store
