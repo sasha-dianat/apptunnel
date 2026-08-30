@@ -327,6 +327,33 @@ grep -q 'idleIsFine' "$SRCD/Telemetry.swift" 2>/dev/null \
   && pass "the FLOW band is marked idle-is-not-failure" \
   || fail "the FLOW band is marked idle-is-not-failure"
 
+# The live meter is the top-left analyser unit, not the phase bars below it.
+[ -f "$SRCD/Visualiser.swift" ] \
+  && pass "Visualiser.swift exists" || fail "Visualiser.swift exists"
+grep -q 'valley' "$SRCD/Visualiser.swift" 2>/dev/null \
+  && pass "the analyser tracks a valley-hold (worst recent value)" \
+  || fail "the analyser tracks a valley-hold (worst recent value)"
+grep -q 'idleIsFine' "$SRCD/Visualiser.swift" 2>/dev/null \
+  && pass "an idle FLOW band is not drawn as an alarm" \
+  || fail "an idle FLOW band is not drawn as an alarm"
+# Both axes must carry meaning: height = health, width = bandwidth.
+grep -q '0.22 + 0.62 \* flow' "$SRCD/Visualiser.swift" 2>/dev/null \
+  && pass "bar width morphs with throughput" \
+  || fail "bar width morphs with throughput"
+for want in drawRadar drawCircuit drawWaterfall; do
+  grep -q "$want" "$SRCD/Visualiser.swift" 2>/dev/null \
+    && pass "the analyser has $want" || fail "the analyser has $want"
+done
+grep -q 'modeCount = 6' "$SRCD/Visualiser.swift" 2>/dev/null \
+  && pass "clicking the analyser cycles all six modes" \
+  || fail "clicking the analyser cycles all six modes"
+grep -q 'drawNeon' "$SRCD/Visualiser.swift" 2>/dev/null \
+  && pass "the analyser has the neon wave field" \
+  || fail "the analyser has the neon wave field"
+grep -q 'snapshot-eq' "$SRCD/main.swift" 2>/dev/null \
+  && pass "the equalizer has a deterministic render hook" \
+  || fail "the equalizer has a deterministic render hook"
+
 # =============================================== argument / guard behaviour ==
 hdr "2. Guards and argument handling"
 

@@ -342,76 +342,6 @@ final class TitleBar: NSView {
 
 // MARK: - Visualiser (bars + oscilloscope, click to toggle)
 
-final class Visualiser: NSView {
-    private let n = 19
-    private var lv: [CGFloat]
-    private var pk: [CGFloat]
-    private var wave = [CGFloat](repeating: 0, count: 76)
-    private var t: CGFloat = 0
-    var scopeMode = false
-
-    override init(frame f: NSRect) {
-        lv = .init(repeating: 0, count: n); pk = .init(repeating: 0, count: n)
-        super.init(frame: f)
-        toolTip = "Click to switch between analyser and oscilloscope"
-    }
-    required init?(coder: NSCoder) { fatalError() }
-
-    override func mouseDown(with e: NSEvent) { scopeMode.toggle(); needsDisplay = true }
-
-    func step() {
-        let m = Model.shared
-        let live = m.sessionActive || m.demoMode || m.connecting
-        let energy: CGFloat = live ? 0.25 + CGFloat(m.completed) / CGFloat(PHASES.count) * 0.75 : 0.04
-        for i in 0..<n {
-            let base = sin(t / 6.5 + CGFloat(i) / 1.9) * 0.38 + 0.5
-            let tilt = 1 - CGFloat(i) / CGFloat(n) / 1.6
-            let target = live ? max(0, base * energy * tilt + Render.rand(0.2) * energy)
-                              : Render.rand(0.04)
-            ease(&lv[i], target, 0.34)
-            pk[i] = max(pk[i] - 0.011, lv[i])
-        }
-        for i in 0..<wave.count {
-            let x = CGFloat(i) / CGFloat(wave.count)
-            wave[i] = live
-                ? sin(x * 12 + t / 4) * 0.34 * energy + sin(x * 27 - t / 6) * 0.2 * energy
-                : sin(x * 6 + t / 9) * 0.02
-        }
-        t += 1
-        needsDisplay = true
-    }
-
-    override func draw(_ r: NSRect) {
-        Skin.lcd.setFill(); bounds.fill()
-        if scopeMode {
-            let mid = bounds.midY
-            let path = NSBezierPath(); path.lineWidth = 1
-            for i in 0..<wave.count {
-                let x = bounds.minX + CGFloat(i) / CGFloat(wave.count - 1) * bounds.width
-                let y = mid + wave[i] * (bounds.height / 2 - 2)
-                i == 0 ? path.move(to: NSPoint(x: x, y: y)) : path.line(to: NSPoint(x: x, y: y))
-            }
-            Skin.green.setStroke(); path.stroke()
-        } else {
-            let bw = bounds.width / CGFloat(n)
-            let h = bounds.height - 3
-            for i in 0..<n {
-                let x = CGFloat(i) * bw + 1
-                var y: CGFloat = 1
-                let bh = max(1, lv[i] * h)
-                while y < bh {
-                    let f = y / h
-                    (f > 0.74 ? Skin.red : f > 0.46 ? Skin.amber : Skin.green)
-                        .withAlphaComponent(0.5 + f * 0.5).setFill()
-                    NSRect(x: x, y: y, width: bw - 2, height: 1).fill()
-                    y += 2
-                }
-                NSColor(white: 0.75, alpha: 0.85).setFill()
-                NSRect(x: x, y: 1 + pk[i] * h, width: bw - 2, height: 1).fill()
-            }
-        }
-    }
-}
 
 // MARK: - Main LCD
 
@@ -841,6 +771,7 @@ final class Main: NSWindow {
 
         y -= 66
         vis.frame = NSRect(x: 8, y: y, width: 170, height: 62)
+        vis.onHover = { [weak self] t in self?.showHint(t) }
         root.addSubview(vis)
         lcd.frame = NSRect(x: 182, y: y, width: W - 190, height: 62)
         root.addSubview(lcd)
@@ -1310,6 +1241,43 @@ final class Delegate: NSObject, NSApplicationDelegate {
         if args.contains(where: { $0.hasPrefix("--snapshot") }) {
             Render.deterministic = true
             Render.reseed()
+        }
+        // Deterministic telemetry render for the suite: synthetic values, no
+        // live session required.
+        if let i = args.firstIndex(of: "--snapshot-eq"), i + 1 < args.count {
+            let out = args[i + 1]
+            // Optional 3rd arg: synthetic FLOW, so the suite can capture the
+            // display both idle and under load.
+            let synthFlow = (i + 3 < args.count ? Double(args[i + 3]) : nil) ?? 0.34
+            let synthetic = """
+            {"t": \(Date().timeIntervalSince1970),
+             "link":1.0,"dns":0.92,"socks":1.0,"bridge":0.88,"exit":1.0,
+             "rtt":0.61,"flow":\(synthFlow),"seal":1.0,"wall":1.0,"grip":1.0,
+             "score":0.93,"exit_ip":"91.207.57.102",
+             "detail":{"link":"gateway 192.168.85.229","dns":"48ms","socks":"127.0.0.1:1080 6ms",
+                       "bridge":"12ms","exit":"91.207.57.102","rtt":"180ms","flow":"3 conn",
+                       "seal":"0/3 reachable","wall":"60 rules","grip":"14 inside"}}
+            """
+            let dir = NSHomeDirectory() + "/.apptunnel"
+            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            try? synthetic.write(toFile: dir + "/telemetry.json", atomically: true, encoding: .utf8)
+            m.sessionActive = true
+            _ = m.telemetry.poll()
+            // Optional trailing arg picks the analyser mode to capture.
+            if i + 2 < args.count, let md = Int(args[i + 2]) { w.vis.mode = md }
+            for _ in 0..<120 { w.vis.step() }
+            w.refresh()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                if let v = w.contentView, let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) {
+                    v.cacheDisplay(in: v.bounds, to: rep)
+                    if let d = rep.representation(using: .png, properties: [:]) {
+                        try? d.write(to: URL(fileURLWithPath: out))
+                        FileHandle.standardError.write("eq snapshot: \(out)\n".data(using: .utf8)!)
+                    }
+                }
+                NSApp.terminate(nil)
+            }
+            return
         }
         if let i = args.firstIndex(of: "--snapshot-log"), i + 1 < args.count {
             let out = args[i + 1]
