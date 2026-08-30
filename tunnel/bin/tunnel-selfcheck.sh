@@ -265,6 +265,40 @@ sed -n '/^join_app()/,/^}/p' "$BIN/tunnel-lock.sh" | grep -q 'kill -KILL' \
   && pass "join falls back past AppleScript when Automation is denied" \
   || fail "join falls back past AppleScript when Automation is denied"
 
+# ================================================= telemetry sampler ========
+hdr "1c. Telemetry sampler"
+if [ ! -x "$BIN/tunnel-telemetry.sh" ]; then
+  fail "tunnel-telemetry.sh exists and is executable"
+else
+  pass "tunnel-telemetry.sh exists and is executable"
+  tsout="$("$BIN/tunnel-telemetry.sh" 2>/dev/null)"
+  if /usr/bin/python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+need = ["t","link","dns","socks","bridge","exit","rtt","flow","seal","wall","grip","score"]
+missing = [k for k in need if k not in d]
+assert not missing, "missing keys: %s" % missing
+bands = [k for k in need if k not in ("t",)]
+bad = [k for k in bands if not isinstance(d[k], (int, float))]
+assert not bad, "non-numeric: %s" % bad
+out = [k for k in bands if not (d[k] == -1.0 or 0.0 <= d[k] <= 1.0)]
+assert not out, "out of range: %s" % out
+assert isinstance(d.get("detail"), dict), "detail must be an object"
+' "$tsout" 2>/dev/null; then
+    pass "the sampler emits a valid, in-range telemetry object"
+  else
+    fail "the sampler emits a valid, in-range telemetry object" "got: $(printf '%s' "$tsout" | head -c 160)"
+  fi
+  st="$(/usr/bin/python3 -c 'import time;print(time.time())')"
+  "$BIN/tunnel-telemetry.sh" >/dev/null 2>&1
+  el="$(/usr/bin/python3 -c 'import sys,time;print(int((time.time()-float(sys.argv[1]))*1000))' "$st")"
+  if [ "${el:-9999}" -lt 8000 ]; then
+    pass "a sampling pass completes in ${el}ms (< 8s budget)"
+  else
+    fail "a sampling pass completes within 8s" "took ${el}ms"
+  fi
+fi
+
 # =============================================== argument / guard behaviour ==
 hdr "2. Guards and argument handling"
 
