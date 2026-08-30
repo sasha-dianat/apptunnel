@@ -11,59 +11,6 @@
 import AppKit
 import Foundation
 
-// MARK: - Skin
-
-enum Skin {
-    static let metalHi   = NSColor(srgbRed: 0.40, green: 0.40, blue: 0.47, alpha: 1)
-    static let metal     = NSColor(srgbRed: 0.235, green: 0.235, blue: 0.275, alpha: 1)
-    static let metalLo   = NSColor(srgbRed: 0.145, green: 0.145, blue: 0.180, alpha: 1)
-    static let metalDeep = NSColor(srgbRed: 0.055, green: 0.055, blue: 0.075, alpha: 1)
-    static let green     = NSColor(srgbRed: 0.000, green: 1.000, blue: 0.298, alpha: 1)
-    static let greenMid  = NSColor(srgbRed: 0.000, green: 0.720, blue: 0.220, alpha: 1)
-    static let greenDim  = NSColor(srgbRed: 0.000, green: 0.380, blue: 0.130, alpha: 1)
-    static let amber     = NSColor(srgbRed: 1.000, green: 0.780, blue: 0.150, alpha: 1)
-    static let red       = NSColor(srgbRed: 1.000, green: 0.290, blue: 0.170, alpha: 1)
-    static let label     = NSColor(srgbRed: 0.66, green: 0.66, blue: 0.74, alpha: 1)
-    static let lcd       = NSColor(srgbRed: 0.02, green: 0.03, blue: 0.02, alpha: 1)
-
-    static func mono(_ s: CGFloat, _ bold: Bool = false) -> NSFont {
-        NSFont.monospacedSystemFont(ofSize: s, weight: bold ? .bold : .regular)
-    }
-}
-
-func bevel(_ r: NSRect, sunken: Bool = false) {
-    let hi = sunken ? Skin.metalDeep : Skin.metalHi
-    let lo = sunken ? Skin.metalHi : Skin.metalDeep
-    hi.setFill()
-    NSRect(x: r.minX, y: r.maxY - 1, width: r.width, height: 1).fill()
-    NSRect(x: r.minX, y: r.minY, width: 1, height: r.height).fill()
-    lo.setFill()
-    NSRect(x: r.minX, y: r.minY, width: r.width, height: 1).fill()
-    NSRect(x: r.maxX - 1, y: r.minY, width: 1, height: r.height).fill()
-}
-
-func text(_ s: String, _ p: NSPoint, _ f: NSFont, _ c: NSColor, glow: CGFloat = 0) {
-    var a: [NSAttributedString.Key: Any] = [.font: f, .foregroundColor: c]
-    if glow > 0 {
-        let sh = NSShadow()
-        sh.shadowColor = c.withAlphaComponent(glow)
-        sh.shadowBlurRadius = 5
-        sh.shadowOffset = .zero
-        a[.shadow] = sh
-    }
-    (s as NSString).draw(at: p, withAttributes: a)
-}
-
-func width(_ s: String, _ f: NSFont) -> CGFloat {
-    (s as NSString).size(withAttributes: [.font: f]).width
-}
-
-/// Frame-rate independent easing toward a target.
-func ease(_ cur: inout CGFloat, _ target: CGFloat, _ rate: CGFloat = 0.22) {
-    cur += (target - cur) * rate
-    if abs(target - cur) < 0.0005 { cur = target }
-}
-
 // MARK: - Model
 
 struct PhaseDef { let name: String; let label: String }
@@ -417,8 +364,8 @@ final class Visualiser: NSView {
         for i in 0..<n {
             let base = sin(t / 6.5 + CGFloat(i) / 1.9) * 0.38 + 0.5
             let tilt = 1 - CGFloat(i) / CGFloat(n) / 1.6
-            let target = live ? max(0, base * energy * tilt + CGFloat.random(in: 0...0.2) * energy)
-                              : CGFloat.random(in: 0...0.04)
+            let target = live ? max(0, base * energy * tilt + Render.rand(0.2) * energy)
+                              : Render.rand(0.04)
             ease(&lv[i], target, 0.34)
             pk[i] = max(pk[i] - 0.011, lv[i])
         }
@@ -476,7 +423,9 @@ final class LCD: NSView {
 
         var clock = "--:--"
         if let s = m.startedAt {
-            let t = Int(Date().timeIntervalSince(s))
+            // Wall time makes a snapshot flap between e.g. 02:14 and 02:15
+            // depending on when the render lands. Pin it when deterministic.
+            let t = Render.deterministic ? 134 : Int(Date().timeIntervalSince(s))
             clock = String(format: "%02d:%02d", t / 60, t % 60)
         }
         text(clock, NSPoint(x: 8, y: 32), Skin.mono(24, true),
@@ -854,13 +803,19 @@ final class Main: NSWindow {
         layout()
         center()
 
-        Timer.scheduledTimer(withTimeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
-            self?.vis.step(); self?.lcd.advance(); self?.bars.step(); self?.pos.step()
-            self?.pulseLED()
+        // Snapshot modes drive the views explicitly with a fixed step count.
+        // Letting the timers also run made an indeterminate number of extra
+        // frames land before capture, so no two renders matched.
+        if !Render.deterministic {
+            Timer.scheduledTimer(withTimeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
+                self?.vis.step(); self?.lcd.advance(); self?.bars.step(); self?.pos.step()
+                self?.pulseLED()
+            }
+            Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in
+                if Model.shared.poll() { self?.refresh() }
+    
         }
-        Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in
-            if Model.shared.poll() { self?.refresh() }
-        }
+    }
     }
 
     private var ledPhase: CGFloat = 0
@@ -1349,6 +1304,11 @@ final class Delegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
 
         let args = CommandLine.arguments
+        // Any snapshot mode renders deterministically so the suite can compare.
+        if args.contains(where: { $0.hasPrefix("--snapshot") }) {
+            Render.deterministic = true
+            Render.reseed()
+        }
         if let i = args.firstIndex(of: "--snapshot-log"), i + 1 < args.count {
             let out = args[i + 1]
             let sample = """

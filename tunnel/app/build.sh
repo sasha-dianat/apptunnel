@@ -4,7 +4,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-SRC="$HERE/AppTunnel/Sources/main.swift"
+SRC_DIR="$HERE/AppTunnel/Sources"
 APP="$HERE/AppTunnel.app"
 MACOS="$APP/Contents/MacOS"
 RES="$APP/Contents/Resources"
@@ -16,11 +16,16 @@ rm -rf "$APP"
 mkdir -p "$MACOS" "$RES"
 
 echo "==> compiling"
+# Compile every file in Sources/ so the app can be split into focused units.
+# An array, not $(ls ...): this project lives under a path containing a space
+# ("Claude-Chatgpt Tunnel"), and unquoted command substitution word-splits it.
+SRCS=("$SRC_DIR"/*.swift)
+[ -e "${SRCS[0]}" ] || { echo "no Swift sources in $SRC_DIR"; exit 1; }
 swiftc -O \
   -target x86_64-apple-macosx11.0 \
   -framework AppKit \
   -o "$MACOS/AppTunnel" \
-  "$SRC"
+  "${SRCS[@]}"
 
 echo "==> bundle metadata"
 cat > "$APP/Contents/Info.plist" <<'PLIST'
