@@ -299,6 +299,23 @@ assert isinstance(d.get("detail"), dict), "detail must be an object"
   fi
 fi
 
+grep -q 'TELEMETRY_FILE' "$BIN/tunnel-lock.sh" \
+  && pass "the launcher publishes telemetry" \
+  || fail "the launcher publishes telemetry"
+# The sampler must run in a BACKGROUNDED SUBSHELL: a pass takes ~0.5s and the
+# watch loop must keep auditing the process tree every 3s regardless.
+wloop="$(sed -n '/^while any_alive; do/,/^done$/p' "$BIN/tunnel-lock.sh")"
+if printf '%s\n' "$wloop" | grep -q 'tunnel-telemetry.sh' \
+   && printf '%s\n' "$wloop" | grep -qE '^\s*\) >/dev/null 2>&1 &\s*$'; then
+  pass "telemetry sampling is detached from the watch loop"
+else
+  fail "telemetry sampling is detached from the watch loop" \
+       "the sampler must sit inside a ( ... ) >/dev/null 2>&1 & subshell"
+fi
+grep -q 'TELEMETRY_LOCK' "$BIN/tunnel-lock.sh" \
+  && pass "overlapping sampling passes are prevented by a lock" \
+  || fail "overlapping sampling passes are prevented by a lock"
+
 # =============================================== argument / guard behaviour ==
 hdr "2. Guards and argument handling"
 

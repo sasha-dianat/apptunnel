@@ -58,6 +58,8 @@ EVENT_LOG="$STATE_DIR/events.jsonl"
 STATE_FILE="$STATE_DIR/session.json"
 STOP_FILE="$STATE_DIR/stop"
 RUN_FILE="$STATE_DIR/run-request"
+TELEMETRY_FILE="$STATE_DIR/telemetry.json"
+TELEMETRY_LOCK="$STATE_DIR/telemetry.lock"
 
 GROUP_NAME="apptun$$"
 GROUP_GID=""
@@ -397,7 +399,7 @@ cleanup() {
   [ -n "$SUDO_KEEPALIVE_PID" ] && kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
   # Only ever remove the lock we ourselves claimed.
   (( STATE_OWNED )) && rm -f "$STATE_FILE" 2>/dev/null
-  rm -f "$STOP_FILE" "$RUN_FILE" 2>/dev/null
+  rm -f "$STOP_FILE" "$RUN_FILE" "$TELEMETRY_FILE" "$TELEMETRY_LOCK" 2>/dev/null
   true
   rm -rf "$TMPROOT" 2>/dev/null || true
 
@@ -451,6 +453,8 @@ if [ "$EUID" -eq 0 ]; then
   STATE_FILE="$STATE_DIR/session.json"
   STOP_FILE="$STATE_DIR/stop"
   RUN_FILE="$STATE_DIR/run-request"
+  TELEMETRY_FILE="$STATE_DIR/telemetry.json"
+  TELEMETRY_LOCK="$STATE_DIR/telemetry.lock"
   SETTINGS_FILE="$LOGIN_HOME/.claude/settings.json"
   CODEX_ENV_FILE="$LOGIN_HOME/.codex/.env"
 elif [ -n "$LOGIN_USER_OVERRIDE" ]; then
@@ -1289,6 +1293,34 @@ with open(sys.argv[1],"rb") as f: print(plistlib.load(f).get("CFBundleExecutable
 
 while any_alive; do
   sleep 3
+
+  # Publish telemetry on a slow cadence. Detached and lock-guarded: a sampling
+  # pass takes about half a second, and this loop must keep auditing the process
+  # tree every 3s regardless. A stale lock older than 2 minutes is ignored so a
+  # killed sampler cannot silence telemetry for the rest of the session.
+  TELEMETRY_TICK=$(( ${TELEMETRY_TICK:-0} + 1 ))
+  if [ $(( TELEMETRY_TICK % 5 )) -eq 0 ]; then
+    if [ -f "$TELEMETRY_LOCK" ] \
+       && [ -n "$(find "$TELEMETRY_LOCK" -mmin +2 2>/dev/null)" ]; then
+      rm -f "$TELEMETRY_LOCK"
+    fi
+    if [ ! -f "$TELEMETRY_LOCK" ]; then
+      (
+        : > "$TELEMETRY_LOCK"
+        snap="$("$(dirname "$0")/tunnel-telemetry.sh" \
+                  --gid "$GROUP_GID" --anchor "$ANCHOR" \
+                  --bridge "$HTTP_PROXY_URL" --exit-ip "$SOCKS_IP" 2>/dev/null)"
+        if [ -n "$snap" ]; then
+          printf '%s\n' "$snap" > "$TELEMETRY_FILE.tmp" \
+            && mv -f "$TELEMETRY_FILE.tmp" "$TELEMETRY_FILE"
+          if (( RUN_AS_ROOT )); then
+            chown "$LOGIN_USER" "$TELEMETRY_FILE" 2>/dev/null || true
+          fi
+        fi
+        rm -f "$TELEMETRY_LOCK"
+      ) >/dev/null 2>&1 &
+    fi
+  fi
 
   # A one-app join request from the roster's RUN button.
   if [ -f "$RUN_FILE" ]; then
