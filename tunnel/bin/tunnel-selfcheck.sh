@@ -238,6 +238,26 @@ else
   fail "the guarded head -1 idiom returns the first match without dying"
 fi
 
+# The VPN repair control was first added only to the web GUI, which the Swift
+# app never loads, so it did not exist for the user who opens AppTunnel.app.
+# Any control the user is told about must exist in the native panel.
+SRC="$BIN/../app/AppTunnel/Sources/main.swift"
+if grep -q 'Btn("VPN REPAIR"' "$SRC" 2>/dev/null; then
+  pass "AppTunnel's native panel has a labelled VPN REPAIR button"
+else
+  fail "AppTunnel's native panel has a labelled VPN REPAIR button"
+fi
+grep -q 'tunnel-veepn-repair.sh' "$SRC" 2>/dev/null \
+  && pass "the native VPN button is wired to tunnel-veepn-repair.sh" \
+  || fail "the native VPN button is wired to tunnel-veepn-repair.sh"
+# Running it as root would inherit root's HOME, find no VeePN config, and leave
+# a root-owned proxy core behind.
+if awk '/func repairVPN\(\)/,/^    }/' "$SRC" 2>/dev/null | grep -q 'Runner.user'; then
+  pass "the VPN repair runs as the user, not as root"
+else
+  fail "the VPN repair runs as the user, not as root"
+fi
+
 # SUDO_USER can be inherited as "root" through a sudo chain, which made the
 # doctor abort after one line and show an almost-empty window.
 for f in tunnel-doctor.sh tunnel-freehost.sh tunnel-testkit.sh; do

@@ -280,6 +280,28 @@ enum Runner {
         return (p.terminationStatus == 0, out)
     }
 
+    /// Runs a shell command as the logged-in user, with no elevation and no
+    /// authorisation dialog.
+    ///
+    /// This is not a convenience: tunnel-veepn-repair.sh reads VeePN's config
+    /// from the user's own ~/Library and starts the proxy core on their behalf.
+    /// Run through `admin` it would inherit root's HOME, find no config, and
+    /// leave a root-owned core behind. Anything that belongs to the user must
+    /// run as the user.
+    /// Blocking — call off the main thread.
+    static func user(_ shell: String) -> (ok: Bool, out: String) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/bash")
+        p.arguments = ["-c", shell]
+        let pipe = Pipe()
+        p.standardOutput = pipe; p.standardError = pipe
+        do { try p.run() } catch { return (false, "\(error)") }
+        let d = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        let out = String(data: d, encoding: .utf8) ?? ""
+        return (p.terminationStatus == 0, out)
+    }
+
     /// Same, but the command is detached so the dialog returns immediately.
     ///
     /// No `nohup`: `do shell script` runs without a controlling terminal, so
@@ -731,7 +753,11 @@ final class Main: NSWindow {
     private var busy = false
 
     init() {
-        super.init(contentRect: NSRect(x: 0, y: 0, width: 556, height: 500),
+        // 662, not 556: the button row is laid out left to right and already
+        // ended at x=504 in a 556-wide window. Everything else on the panel is
+        // sized from the window width (W - 16, W - 190), so widening stretches
+        // rather than breaks it.
+        super.init(contentRect: NSRect(x: 0, y: 0, width: 662, height: 500),
                    styleMask: [.borderless, .miniaturizable],
                    backing: .buffered, defer: false)
         backgroundColor = Skin.metal
@@ -806,6 +832,9 @@ final class Main: NSWindow {
         add(Btn(">>|", 34,
                 tip: "REPAIR — removes orphaned groups, dead bridges, stale firewall anchors and dead proxy entries. Never touches DHCP, DNS or Wi-Fi.")
                 { self.runDoctor(fix: true) }, gap: 10)
+        add(Btn("VPN REPAIR", 96, tint: Skin.green,
+                tip: "Brings the VeePN tunnel up. Press this first if CONNECT stops at phase 2: VeePN says \"connected\" while its core is not actually running, so there is no SOCKS5 endpoint to tunnel through. Runs as you, asks for no password, and leaves running apps alone.")
+                { self.repairVPN() }, gap: 10)
         add(Btn("DNS RESCUE", 92, tint: Skin.amber,
                 tip: "Use if the whole Mac loses the Internet. Finds firewall rules that block DNS machine-wide and removes only those. Do NOT reset your network settings instead.")
                 { self.runDNSGuard() }, gap: 10)
@@ -1010,6 +1039,20 @@ final class Main: NSWindow {
             Model.shared.lastMessage = ok ? "diagnostics complete" : "diagnostics failed"
             self.refresh()
             self.showLog(fix ? "TUNNEL DOCTOR — REPAIR" : "TUNNEL DOCTOR — READ ONLY", self.strip(out))
+        }
+    }
+
+    /// Bring VeePN's Shadowsocks tunnel up, so CONNECT has a SOCKS5 endpoint
+    /// to find. VeePN.app reports "connected" while its core is not running,
+    /// which leaves 127.0.0.1 with no listener and stalls the launcher at
+    /// phase 2. Safe to press at any time: it starts a proxy core and repoints
+    /// the system proxy, and never signals the launcher or the tunnelled apps.
+    func repairVPN() {
+        let cmd = Runner.q(script("tunnel-veepn-repair.sh")) + " 2>&1"
+        withBusy("bringing the VeePN tunnel up…", { Runner.user(cmd) }) { ok, out in
+            Model.shared.lastMessage = ok ? "VPN tunnel up" : "VPN repair failed"
+            self.refresh()
+            self.showLog("VPN REPAIR", self.strip(out))
         }
     }
 
