@@ -6,18 +6,17 @@
 // as a screensaver, and it cost a redraw plus a compositor pass thirty times a
 // second to say "still fine".
 //
-// So the DEFAULT is now STATUS: four numbers and a word, redrawn only when one
-// of them changes. A steady tunnel costs nothing between samples. The animated
-// modes are still here, one click away, for when the shape of a fault is more
-// useful than its name.
+// So the DEFAULT is now TRAFFIC: a bidirectional bandwidth graph, input filling
+// up from a centre axis and output filling down, on one shared scale. The
+// asymmetry is the reading - browsing is lopsided green, an upload flips it
+// blue, a stalled tunnel is a flat line. Second is STATUS: four numbers and a
+// word. Both redraw only when a displayed value changes, so a steady tunnel
+// costs nothing between samples.
 //
-// A band at full height is healthy, so a FALLING bar is the alarm. That inverts
-// the classic peak-hold into a VALLEY-hold: the red tick marks the worst value
-// seen in the last half-minute, so a brief outage stays visible after it has
-// recovered rather than silently healing.
-//
-// Click to cycle:
-//   bands · radar · oscilloscope · signal path · latency history
+// The animated instruments are still here, one click away. Among them, a band
+// at full height is healthy, so a FALLING bar is the alarm - a VALLEY-hold
+// rather than the classic peak-hold, with the red tick marking the worst value
+// of the last half-minute so a brief outage stays visible after it recovers.
 //
 // The radar is the one to watch. Ten spokes, one per factor, closed into a
 // polygon: perfect health is a regular decagon, so the SHAPE is the reading -
@@ -32,13 +31,13 @@ import AppKit
 final class Visualiser: NSView {
     var onHover: ((String?) -> Void)?
 
-    // Mode 0 is STATUS: a plain readout of the numbers that matter, drawn only
-    // when they change. The animated modes are real instruments fed by real
-    // telemetry, but a moving bar graph reads as decoration however honest its
-    // data is, and it costs a redraw plus a compositor pass thirty times a
-    // second to say "still fine". The default is now the boring one.
+    // Modes 0 and 1 (TRAFFIC, STATUS) are event-driven readouts: they redraw
+    // only when a displayed value moves. The rest are animated instruments -
+    // real data, but a moving graph reads as decoration however honest it is,
+    // and it costs a redraw plus a compositor pass thirty times a second to
+    // say "still fine".
     var mode = 0
-    let modeCount = 7
+    let modeCount = 8
     private var statusSig = ""
 
     private var shown     = [CGFloat](repeating: 0.04, count: BANDS.count)
@@ -60,7 +59,7 @@ final class Visualiser: NSView {
 
     override init(frame f: NSRect) {
         super.init(frame: f)
-        toolTip = "Tunnel status. Click to cycle: status · bands · radar · oscilloscope · signal path · latency history · neon"
+        toolTip = "Network traffic: input above the axis, output below. Click to cycle: traffic · status · bands · radar · oscilloscope · signal path · latency history · neon"
         addTrackingArea(NSTrackingArea(rect: .zero,
                         options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways, .inVisibleRect],
                         owner: self))
@@ -93,10 +92,14 @@ final class Visualiser: NSView {
         let m = Model.shared
         let tel = m.telemetry
 
-        // STATUS animates nothing. Skip every smoothing accumulator below and
-        // only ask for a redraw when a displayed value actually moved.
-        if mode == 0 {
-            let sig = statusSignature()
+        // TRAFFIC and STATUS animate nothing. Skip every smoothing accumulator
+        // below and only ask for a redraw when a displayed value actually moved.
+        if mode <= 1 {
+            let sig = mode == 0
+                // Quantised to whole KB/s: the exact byte count changes on
+                // every poll and would repaint the gradient trace continuously.
+                ? "\(m.net.inHistory.count)|\(Int(m.net.inBytesPerSecond / 1024))|\(Int(m.net.outBytesPerSecond / 1024))"
+                : statusSignature()
             if sig != statusSig { statusSig = sig; needsDisplay = true }
             return
         }
@@ -163,14 +166,132 @@ final class Visualiser: NSView {
     override func draw(_ r: NSRect) {
         Skin.lcd.setFill(); bounds.fill()
         switch mode {
-        case 0: drawStatus()
-        case 1: live ? drawBands() : drawDeco()
-        case 2: drawRadar()
-        case 3: drawScope()
-        case 4: drawCircuit()
-        case 5: drawWaterfall()
+        case 0: drawTraffic()
+        case 1: drawStatus()
+        case 2: live ? drawBands() : drawDeco()
+        case 3: drawRadar()
+        case 4: drawScope()
+        case 5: drawCircuit()
+        case 6: drawWaterfall()
         default: drawNeon()
         }
+    }
+
+    /// TRAFFIC — a bidirectional bandwidth graph.
+    ///
+    /// Input fills upward from a centre axis, output fills downward, both on one
+    /// shared scale so the asymmetry between them is the reading: a browsing
+    /// session is lopsided green, an upload flips it blue, and a stalled tunnel
+    /// is a flat line through the middle. The scale is the window maximum, so
+    /// the shape stays legible whether the link is doing 4 KB/s or 4 MB/s, with
+    /// the peak printed so the height is never ambiguous.
+    private func drawTraffic() {
+        let net = Model.shared.net
+        let labelH: CGFloat = 10
+        let plotTop = bounds.height - labelH
+        let mid = plotTop / 2
+        let plotH = mid - 1.5
+
+        func rate(_ b: Double) -> String {
+            if b < 1000            { return String(format: "%.0f B/s", b) }
+            if b < 1000 * 1024     { return String(format: "%.0f KB/s", b / 1024) }
+            return String(format: "%.1f MB/s", b / 1024 / 1024)
+        }
+
+        // A three-tap mean. The kernel counters are read on a timer, so raw
+        // samples are spiky in a way that says nothing about the link; smoothing
+        // keeps the silhouette readable without inventing data.
+        func smoothed(_ s: [Double]) -> [Double] {
+            guard s.count > 2 else { return s }
+            var o = s
+            for i in 1..<(s.count - 1) { o[i] = (s[i-1] + s[i] * 2 + s[i+1]) / 4 }
+            return o
+        }
+        let ins = smoothed(net.inHistory), outs = smoothed(net.outHistory)
+
+        // Faint quarter gridlines, then the axis a little brighter.
+        NSColor(white: 1, alpha: 0.05).setStroke()
+        for f in [0.5 as CGFloat, 1.0] {
+            for dir in [1.0 as CGFloat, -1.0] {
+                let y = mid + dir * plotH * f
+                let g = NSBezierPath()
+                g.move(to: NSPoint(x: 0, y: y)); g.line(to: NSPoint(x: bounds.width, y: y))
+                g.lineWidth = 1; g.stroke()
+            }
+        }
+        NSColor(white: 1, alpha: 0.16).setStroke()
+        let ax = NSBezierPath()
+        ax.move(to: NSPoint(x: 0, y: mid)); ax.line(to: NSPoint(x: bounds.width, y: mid))
+        ax.lineWidth = 1; ax.stroke()
+
+        guard ins.count > 1 else {
+            let f = Skin.mono(8, false)
+            let s = "listening for traffic"
+            let w = (s as NSString).size(withAttributes: [.font: f]).width
+            text(s, NSPoint(x: (bounds.width - w) / 2, y: mid - 5), f, Skin.metalHi)
+            return
+        }
+
+        // One shared scale, with a 16 KB/s floor so an idle link is a calm flat
+        // line rather than amplified noise.
+        let peak = max(ins.max() ?? 0, outs.max() ?? 0, 16 * 1024)
+        let dx = bounds.width / CGFloat(ThroughputMeter.historyLen - 1)
+
+        func area(_ series: [Double], up: Bool, _ tint: NSColor) {
+            guard series.count > 1 else { return }
+            // Right-aligned: newest sample at the right edge, so the graph grows
+            // leftwards into history instead of stretching as it fills.
+            let x0 = bounds.width - CGFloat(series.count - 1) * dx
+            let p = NSBezierPath()
+            p.move(to: NSPoint(x: x0, y: mid))
+            for (i, v) in series.enumerated() {
+                let h = CGFloat(min(1.0, v / peak)) * plotH
+                p.line(to: NSPoint(x: x0 + CGFloat(i) * dx, y: up ? mid + h : mid - h))
+            }
+            p.line(to: NSPoint(x: bounds.width, y: mid))
+            p.close()
+
+            // Gradient body: saturated at the axis, fading out toward the peak,
+            // so overlapping traces stay legible and the baseline reads as the
+            // anchor rather than the edge.
+            NSGraphicsContext.saveGraphicsState()
+            p.addClip()
+            let g = NSGradient(colors: [tint.withAlphaComponent(0.55),
+                                        tint.withAlphaComponent(0.06)])
+            g?.draw(in: NSRect(x: 0, y: up ? mid : mid - plotH,
+                               width: bounds.width, height: plotH),
+                    angle: up ? 90 : -90)
+            NSGraphicsContext.restoreGraphicsState()
+
+            // Bright hairline along the top of the trace only.
+            let line = NSBezierPath()
+            for (i, v) in series.enumerated() {
+                let h = CGFloat(min(1.0, v / peak)) * plotH
+                let pt = NSPoint(x: x0 + CGFloat(i) * dx, y: up ? mid + h : mid - h)
+                i == 0 ? line.move(to: pt) : line.line(to: pt)
+            }
+            line.lineWidth = 1
+            line.lineJoinStyle = .round
+            tint.withAlphaComponent(0.9).setStroke()
+            line.stroke()
+        }
+        area(ins,  up: true,  Skin.green)
+        area(outs, up: false, Skin.cyan)
+
+        // Header: a colour chip per direction with its current rate, and the
+        // scale on the right so a tall trace is never ambiguous.
+        let f = Skin.mono(8, false)
+        let y = bounds.height - labelH + 1
+        func chip(_ x: CGFloat, _ c: NSColor, _ s: String) -> CGFloat {
+            c.setFill(); NSBezierPath(ovalIn: NSRect(x: x, y: y + 2, width: 4, height: 4)).fill()
+            text(s, NSPoint(x: x + 7, y: y), f, Skin.label)
+            return x + 7 + (s as NSString).size(withAttributes: [.font: f]).width + 9
+        }
+        let nx = chip(4, Skin.green, rate(net.inBytesPerSecond))
+        _ = chip(nx, Skin.cyan, rate(net.outBytesPerSecond))
+        let pk = rate(peak)
+        let pw = (pk as NSString).size(withAttributes: [.font: f]).width
+        text(pk, NSPoint(x: bounds.width - pw - 4, y: y), f, Skin.metalHi)
     }
 
     /// STATUS — the readout, not the light show.

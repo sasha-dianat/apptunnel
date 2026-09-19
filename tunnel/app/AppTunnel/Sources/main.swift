@@ -9,6 +9,7 @@
 // macOS itself and never passes through this process.
 
 import AppKit
+import Darwin
 import Foundation
 
 // MARK: - Model
@@ -61,6 +62,37 @@ final class Model {
     var tunnelled: Set<String> = []
     let telemetry = TelemetryStore()
     let net = ThroughputMeter()
+
+    /// True when the VeePN tunnel this app manages is actually serving.
+    ///
+    /// Determined by connecting to its HTTP inbound on loopback, NOT by reading
+    /// a state file. The file can be absent (a tunnel started before the file
+    /// was introduced) or stale (a core killed from outside), and a toggle that
+    /// misreads the state turns "stop" into "start a second one". A loopback
+    /// connect answers the only question that matters - is something serving on
+    /// that port right now - and returns immediately either way.
+    ///
+    /// Port 1091 is this app's own HTTP inbound. VeePN.app's core uses its own
+    /// ports, so the two are never confused.
+    var veepnUp = false
+    func pollVeePN() {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { veepnUp = false; return }
+        defer { close(fd) }
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = UInt16(1091).bigEndian
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        var tv = timeval(tv_sec: 0, tv_usec: 150_000)
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        let r = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        veepnUp = (r == 0)
+    }
     var runFile: String { stateDir + "/run-request" }
     private var scanTick = 0
     var startedAt: Date?
@@ -124,14 +156,21 @@ final class Model {
         let prot = readProtection()
         if prot != protectedHost { protectedHost = prot; dirty = true }
         scanTick += 1
-        if scanTick % 5 == 0 {           // ~every 2s, not every poll
+        // Every ~5s. This forks `ps` and costs about 0.1s of CPU each time, and
+        // group membership changes only when an app joins or leaves a tunnel.
+        if scanTick % 12 == 0 {
             let before = tunnelled
             tunnelled = scanTunnelled()
             if before != tunnelled { dirty = true }
         }
         if !demoMode && consumeEvents() { dirty = true }
         if !demoMode && telemetry.poll() { dirty = true }
-        if net.sample() { dirty = true }
+        // Deliberately does NOT set dirty. Throughput changes constantly while
+        // traffic flows, and refresh() repaints the whole window - title bar,
+        // marquee, phase bars, roster and position strip - when the only thing
+        // that moved is the graph. The visualiser notices the change itself and
+        // redraws just its own 170x62 rect.
+        net.sample()
         return dirty
     }
 
@@ -528,7 +567,7 @@ final class PhaseBars: NSView {
 // MARK: - Button
 
 final class Btn: NSView {
-    let title: String
+    var title: String
     var tint: NSColor
     var action: () -> Void
     private var down = false
@@ -747,6 +786,8 @@ final class Main: NSWindow {
     let bars = PhaseBars(frame: .zero)
     let roster = Roster(frame: .zero)
     let tb = TitleBar(frame: .zero)
+    /// Held so its label can follow the tunnel state (START / STOP).
+    private var vpnBtn: Btn?
     let caption = NSTextField(labelWithString: "")
     let hint = NSTextField(labelWithString: "")
     private var logWindows: [LogWindow] = []
@@ -889,9 +930,10 @@ final class Main: NSWindow {
         add(Btn(">>|", 34,
                 tip: "REPAIR — removes orphaned groups, dead bridges, stale firewall anchors and dead proxy entries. Never touches DHCP, DNS or Wi-Fi.")
                 { self.runDoctor(fix: true) }, gap: 10)
-        add(Btn("VPN REPAIR", 96, tint: Skin.green,
-                tip: "Brings the VeePN tunnel up. Press this first if CONNECT stops at phase 2: VeePN says \"connected\" while its core is not actually running, so there is no SOCKS5 endpoint to tunnel through. Runs as you, asks for no password, and leaves running apps alone.")
-                { self.repairVPN() }, gap: 10)
+        vpnBtn = Btn("VPN START", 96, tint: Skin.green,
+                tip: "Starts or stops the VeePN tunnel. VeePN.app's own Disconnect cannot stop this one - it runs a separate core that this app started - so this is the lever for it. Runs as you and asks for no password.")
+                { self.toggleVPN() }
+        add(vpnBtn!, gap: 10)
         add(Btn("DNS RESCUE", 92, tint: Skin.amber,
                 tip: "Use if the whole Mac loses the Internet. Finds firewall rules that block DNS machine-wide and removes only those. Do NOT reset your network settings instead.")
                 { self.runDNSGuard() }, gap: 10)
@@ -961,6 +1003,19 @@ final class Main: NSWindow {
         // Connecting starts the LED pulsing and the phase animation, so the
         // frame rate has to follow the state, not just window occlusion.
         retimeAnimation()
+
+        // The VPN control is a toggle, so its label has to say which way it
+        // will go. Without this the only way to stop the tunnel was a terminal.
+        Model.shared.pollVeePN()
+        if let b = vpnBtn {
+            let up = Model.shared.veepnUp
+            let want = up ? "VPN STOP" : "VPN START"
+            if b.title != want {
+                b.title = want
+                b.tint = up ? Skin.red : Skin.green
+                b.needsDisplay = true
+            }
+        }
         if hintOverride != nil { return }   // do not fight the hover description
         let m = Model.shared
         tb.led = m.failed ? Skin.red : m.sessionActive ? Skin.green
@@ -1123,6 +1178,24 @@ final class Main: NSWindow {
             Model.shared.lastMessage = ok ? "VPN tunnel up" : "VPN repair failed"
             self.refresh()
             self.showLog("VPN REPAIR", self.strip(out))
+        }
+    }
+
+    /// Start or stop OUR VeePN core. Stopping it is the only way to undo what
+    /// the repair script did: VeePN.app has no handle on that process, so its
+    /// Disconnect leaves the tunnel up and the exit IP unchanged.
+    func toggleVPN() {
+        let m = Model.shared
+        m.pollVeePN()
+        let stopping = m.veepnUp
+        let cmd = Runner.q(script("tunnel-veepn-repair.sh")) + (stopping ? " --stop" : "") + " 2>&1"
+        withBusy(stopping ? "stopping the VeePN tunnel…" : "bringing the VeePN tunnel up…",
+                 { Runner.user(cmd) }) { ok, out in
+            m.pollVeePN()
+            m.lastMessage = ok ? (stopping ? "VPN tunnel stopped" : "VPN tunnel up")
+                               : (stopping ? "VPN stop failed" : "VPN repair failed")
+            self.refresh()
+            self.showLog(stopping ? "VPN STOP" : "VPN REPAIR", self.strip(out))
         }
     }
 

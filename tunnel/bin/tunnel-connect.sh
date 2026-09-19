@@ -42,7 +42,15 @@ find_pids() {
     | awk -v re="$1" '$0 ~ re && $0 !~ /awk/ && $0 !~ /sh -c/ && $0 !~ /tunnel-connect/ {print $1}'
 }
 
-LEGACY='Claude-and-ChatGPT-VeePN-Protected|veepn-shadowsocks-lock'
+# tunnel-lock.sh is in this list deliberately.
+#
+# The tunnel's bridge binds a FIXED port so a reconnecting app finds it where
+# its baked-in HTTP_PROXY expects. That makes two launchers mutually exclusive:
+# the second one dies at phase 3 with "Address already in use", which is what
+# pressing play during a live session used to do. Retiring the incumbent first
+# is safe now that teardown leaves the tunnelled apps running - they keep their
+# gid, survive the handover, and are adopted by the launcher that replaces it.
+LEGACY='Claude-and-ChatGPT-VeePN-Protected|veepn-shadowsocks-lock|tunnel-lock\.sh'
 
 # Test protection: tunnel-testkit.sh can record the process ancestry of the app
 # hosting whoever is driving us (e.g. Claude Code running inside Claude
@@ -132,7 +140,7 @@ fi
 
 stamp "checking for legacy launcher sessions"
 # Supervisors first, so they cannot respawn the launchers we are about to stop.
-for pattern in 'Claude-and-ChatGPT-VeePN-Protected' 'veepn-shadowsocks-lock'; do
+for pattern in 'Claude-and-ChatGPT-VeePN-Protected' 'veepn-shadowsocks-lock' 'tunnel-lock\.sh'; do
   pids="$(find_pids "$pattern" | drop_protected | only_pids)"
   if [ -n "$pids" ]; then
     stamp "stopping $(echo "$pids" | tr '\n' ' ')"
@@ -157,6 +165,21 @@ if [ -n "$left" ]; then
   sleep 1
 fi
 stamp "legacy sessions retired"
+
+# The retired launcher's bridge socket can outlive the process by a moment. The
+# replacement binds a FIXED port, so handing off before the old socket is gone
+# fails at phase 3 with "Address already in use" - the one error this ordering
+# exists to prevent.
+BRIDGE_PORT_WAIT="${TUNNEL_BRIDGE_PORT:-17080}"
+i=0
+while [ "$i" -lt 40 ]; do
+  /usr/sbin/netstat -an -p tcp 2>/dev/null \
+    | awk -v p=".$BRIDGE_PORT_WAIT" '$6=="LISTEN" && index($4,p)==length($4)-length(p)+1 {f=1} END{exit !f}' \
+    || break
+  [ "$i" = 0 ] && stamp "waiting for the previous bridge on $BRIDGE_PORT_WAIT to close"
+  sleep 0.25
+  i=$((i + 1))
+done
 
 # Their cleanup may not have completed; make sure no machine-wide DNS block is
 # left armed before we build a new tunnel on top.

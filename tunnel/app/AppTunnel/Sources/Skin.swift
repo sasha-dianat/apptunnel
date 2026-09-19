@@ -14,6 +14,8 @@ enum Skin {
     static let greenMid  = NSColor(srgbRed: 0.000, green: 0.720, blue: 0.220, alpha: 1)
     static let greenDim  = NSColor(srgbRed: 0.000, green: 0.380, blue: 0.130, alpha: 1)
     static let amber     = NSColor(srgbRed: 1.000, green: 0.780, blue: 0.150, alpha: 1)
+    /// Outbound traffic, paired with `green` for inbound on the bandwidth graph.
+    static let cyan      = NSColor(srgbRed: 0.180, green: 0.560, blue: 1.000, alpha: 1)
     static let red       = NSColor(srgbRed: 1.000, green: 0.290, blue: 0.170, alpha: 1)
     static let label     = NSColor(srgbRed: 0.66, green: 0.66, blue: 0.74, alpha: 1)
     static let lcd       = NSColor(srgbRed: 0.02, green: 0.03, blue: 0.02, alpha: 1)

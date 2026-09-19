@@ -58,14 +58,43 @@ inf() { printf '   %s...%s   %s\n'   "$Y" "$O" "$1"; }
 exit_ip() { /usr/bin/curl -4fsS -x "http://127.0.0.1:$HTTP_PORT" \
               --connect-timeout 6 --max-time 20 https://api.ipify.org 2>/dev/null; }
 
+# OUR core only, identified by OUR config path.
+#
+# VeePN.app runs the same binary for its own tunnel (`v2ray run -config ...`)
+# while this script runs `v2ray run -c ~/.apptunnel/veepn/config.json`. Matching
+# on the binary alone caught both, so stopping this tunnel also killed VeePN's
+# own process - and, worse, made the two indistinguishable when deciding whether
+# anything of ours was running at all.
+# Both conditions are required: the command must BEGIN with the v2ray binary and
+# also mention our config. Testing the config alone matched the very `awk` doing
+# the testing, because the path is on its own command line - the same
+# self-matching trap main_pids_of documents for grep, in a function that feeds
+# a kill.
 core_pids() { /bin/ps -axo pid=,command= \
+                | awk -v e="$V2RAY" -v c="$CFG" \
+                  '{p=$1; $1=""; sub(/^[ \t]+/,""); if (index($0, e)==1 && index($0, c)>0) print p}'; }
+
+# Anyone's v2ray, ours or VeePN.app's - only used for reporting.
+all_core_pids() { /bin/ps -axo pid=,command= \
                 | awk -v e="$V2RAY" '{p=$1;$1="";sub(/^[ \t]+/,"");if(index($0,e)==1)print p}'; }
+
+STATEFILE="$STATE/tunnel.json"
+
+write_state() {  # $1 = exit ip
+  /bin/mkdir -p "$STATE"
+  printf '{"pid":%s,"socks":%s,"http":%s,"exit_ip":"%s","at":%s}\n' \
+    "$(core_pids | head -1 || echo 0)" "$SOCKS_PORT" "$HTTP_PORT" "$1" \
+    "$(date +%s)" > "$STATEFILE" 2>/dev/null || true
+}
+clear_state() { /bin/rm -f "$STATEFILE" 2>/dev/null || true; }
 
 # ---------------------------------------------------------------- status ---
 if [ "${1:-}" = "--status" ]; then
   printf '\nVeePN tunnel status\n\n'
   pids="$(core_pids)"
-  [ -n "$pids" ] && ok "core running (pid $(echo "$pids" | tr '\n' ' '))" || bad "core not running"
+  [ -n "$pids" ] && ok "our core running (pid $(echo "$pids" | tr '\n' ' '))" || bad "our core not running"
+  others="$(all_core_pids | grep -vxF "${pids:-__none__}" | tr '\n' ' ' || true)"
+  [ -n "${others// /}" ] && inf "VeePN.app is also running its own core (pid $others) - its Disconnect stops that one, not ours"
   /usr/sbin/scutil --proxy | awk '/SOCKS(Enable|Proxy|Port)|HTTP(Enable|Proxy|Port)/{print "         "$0}'
   ip="$(exit_ip)"
   [ -n "$ip" ] && ok "exit IP $ip" || bad "no exit IP (tunnel not carrying traffic)"
@@ -90,7 +119,8 @@ if [ "${1:-}" = "--stop" ]; then
     inf "this network DPI-blocks direct HTTPS; expect no internet until a tunnel is up"
   fi
   pids="$(core_pids)"
-  if [ -n "$pids" ]; then kill -TERM $pids 2>/dev/null; ok "core stopped"; else inf "core was not running"; fi
+  if [ -n "$pids" ]; then kill -TERM $pids 2>/dev/null; ok "our core stopped"; else inf "our core was not running"; fi
+  clear_state
   printf '\n'
   exit 0
 fi
@@ -147,6 +177,7 @@ if [ -z "$ip" ]; then
   exit 1
 fi
 ok "tunnel up, exit IP $ip"
+write_state "$ip"
 
 # Claim the system proxy only once the tunnel is proven, so a failure here can
 # never leave the machine pointed at a dead port.

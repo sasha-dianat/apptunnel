@@ -90,24 +90,43 @@ final class ThroughputMeter {
     /// Set by the snapshot modes so a render can show a chosen load.
     var pinned: Double? = nil { didSet { if let v = pinned { level = v } } }
 
-    private var lastBytes: UInt64 = 0
+    // Separated by direction, because a bandwidth graph that sums them cannot
+    // show the asymmetry that actually characterises a link - a download and an
+    // upload of the same size are the same line.
+    private(set) var inBytesPerSecond: Double = 0
+    private(set) var outBytesPerSecond: Double = 0
+
+    /// Rolling history, newest last, in bytes/sec. Sized for the width of the
+    /// panel so the graph never has to resample.
+    static let historyLen = 160
+    private(set) var inHistory  = [Double]()
+    private(set) var outHistory = [Double]()
+
+    /// History advances at ~1Hz, not at the poll rate. The graph is redrawn
+    /// when a new point lands, and a filled gradient trace is far too expensive
+    /// to repaint 2.5 times a second to add a column one pixel wide.
+    private var lastHistAt: TimeInterval = 0
+
+    private var lastIn: UInt64 = 0
+    private var lastOut: UInt64 = 0
     private var lastAt: TimeInterval = 0
 
-    private func totalBytes() -> UInt64 {
-        var total: UInt64 = 0
+    private func directedBytes() -> (UInt64, UInt64) {
+        var rx: UInt64 = 0, tx: UInt64 = 0
         var ifap: UnsafeMutablePointer<ifaddrs>?
-        guard getifaddrs(&ifap) == 0 else { return 0 }
+        guard getifaddrs(&ifap) == 0 else { return (0, 0) }
         defer { freeifaddrs(ifap) }
         var p = ifap
         while let cur = p {
             if cur.pointee.ifa_addr?.pointee.sa_family == UInt8(AF_LINK),
                let raw = cur.pointee.ifa_data {
                 let d = raw.assumingMemoryBound(to: if_data.self)
-                total &+= UInt64(d.pointee.ifi_ibytes) &+ UInt64(d.pointee.ifi_obytes)
+                rx &+= UInt64(d.pointee.ifi_ibytes)
+                tx &+= UInt64(d.pointee.ifi_obytes)
             }
             p = cur.pointee.ifa_next
         }
-        return total
+        return (rx, tx)
     }
 
     /// Returns true when the level moved enough to be worth redrawing.
@@ -115,13 +134,24 @@ final class ThroughputMeter {
     func sample() -> Bool {
         if let v = pinned { level = v; return false }
         let now = Date().timeIntervalSince1970
-        let bytes = totalBytes()
-        defer { lastBytes = bytes; lastAt = now }
-        guard lastAt > 0, bytes >= lastBytes else { return false }
+        let (rx, tx) = directedBytes()
+        let bytes = rx &+ tx
+        defer { lastIn = rx; lastOut = tx; lastAt = now }
+        guard lastAt > 0, rx >= lastIn, tx >= lastOut else { return false }
 
         let dt = now - lastAt
         guard dt > 0.2 else { return false }
-        bytesPerSecond = Double(bytes - lastBytes) / dt
+        bytesPerSecond    = Double(bytes &- (lastIn &+ lastOut)) / dt
+        inBytesPerSecond  = Double(rx - lastIn) / dt
+        outBytesPerSecond = Double(tx - lastOut) / dt
+
+        if now - lastHistAt >= 1.0 {
+            lastHistAt = now
+            inHistory.append(inBytesPerSecond)
+            outHistory.append(outBytesPerSecond)
+        }
+        if inHistory.count  > ThroughputMeter.historyLen { inHistory.removeFirst(inHistory.count - ThroughputMeter.historyLen) }
+        if outHistory.count > ThroughputMeter.historyLen { outHistory.removeFirst(outHistory.count - ThroughputMeter.historyLen) }
 
         // log scale: 1 KB/s registers, 4 MB/s saturates
         let norm = min(1.0, log1p(bytesPerSecond / 1024.0) / log1p(4096.0))

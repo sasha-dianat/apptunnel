@@ -267,10 +267,13 @@ fi
 # app never loads, so it did not exist for the user who opens AppTunnel.app.
 # Any control the user is told about must exist in the native panel.
 SRC="$BIN/../app/AppTunnel/Sources/main.swift"
-if grep -q 'Btn("VPN REPAIR"' "$SRC" 2>/dev/null; then
-  pass "AppTunnel's native panel has a labelled VPN REPAIR button"
+SRC2="$BIN/../app/AppTunnel/Sources/Visualiser.swift"
+# The control is a toggle now: it reads VPN START or VPN STOP depending on
+# whether our core is running, because VeePN.app's own Disconnect cannot stop it.
+if grep -q 'Btn("VPN START"' "$SRC" 2>/dev/null && grep -q '"VPN STOP"' "$SRC" 2>/dev/null; then
+  pass "AppTunnel's native panel has a labelled VPN start/stop button"
 else
-  fail "AppTunnel's native panel has a labelled VPN REPAIR button"
+  fail "AppTunnel's native panel has a labelled VPN start/stop button"
 fi
 grep -q 'tunnel-veepn-repair.sh' "$SRC" 2>/dev/null \
   && pass "the native VPN button is wired to tunnel-veepn-repair.sh" \
@@ -305,6 +308,36 @@ if awk '/private func pulseLED/,/^    }/' "$SRC" 2>/dev/null | grep -q 'if v != 
 else
   fail "the LED only forces a redraw when its value actually changed"
 fi
+
+# The panel's default was a bar animation with no stated meaning. It is now a
+# bidirectional bandwidth graph, and both readout modes redraw only on change.
+grep -q 'case 0: drawTraffic()' "$SRC2" 2>/dev/null \
+  && pass "the default panel mode is the traffic graph" \
+  || fail "the default panel mode is the traffic graph"
+grep -q 'inBytesPerSecond' "$BIN/../app/AppTunnel/Sources/Telemetry.swift" 2>/dev/null \
+  && pass "throughput is measured per direction, not summed" \
+  || fail "throughput is measured per direction, not summed"
+# Throughput changes constantly; letting it dirty the window repainted
+# everything several times a second and cost ~10% of a core.
+if grep -qE '^\s*if net\.sample\(\) \{ dirty = true \}' "$SRC" 2>/dev/null; then
+  fail "throughput changes do not repaint the whole window"
+else
+  pass "throughput changes do not repaint the whole window"
+fi
+# VeePN.app cannot stop the core this app starts, so the app must offer the lever.
+grep -q 'func toggleVPN' "$SRC" 2>/dev/null \
+  && pass "the VPN control can stop the tunnel, not only start it" \
+  || fail "the VPN control can stop the tunnel, not only start it"
+# A toggle that misreads the state turns "stop" into "start a second core". The
+# state file can be absent or stale, so the live endpoint is probed instead.
+if awk '/func pollVeePN/,/^    }/' "$SRC" 2>/dev/null | grep -q 'Darwin.connect'; then
+  pass "the VPN toggle reads the live endpoint, not a state file"
+else
+  fail "the VPN toggle reads the live endpoint, not a state file"
+fi
+grep -qE 'index\(\$0, e\)==1 && index\(\$0, c\)>0' "$BIN/tunnel-veepn-repair.sh" 2>/dev/null \
+  && pass "the repair script targets only its own core, not VeePN.app's" \
+  || fail "the repair script targets only its own core, not VeePN.app's"
 
 grep -q 'who.*AppTunnel stop button' "$SRC" 2>/dev/null \
   && pass "the stop button records who requested the stop" \
@@ -579,9 +612,15 @@ for want in drawRadar drawCircuit drawWaterfall; do
   grep -q "$want" "$SRCD/Visualiser.swift" 2>/dev/null \
     && pass "the analyser has $want" || fail "the analyser has $want"
 done
-grep -q 'modeCount = 6' "$SRCD/Visualiser.swift" 2>/dev/null \
-  && pass "clicking the analyser cycles all six modes" \
-  || fail "clicking the analyser cycles all six modes"
+_mc="$(grep -oE 'modeCount = [0-9]+' "$SRCD/Visualiser.swift" 2>/dev/null | grep -oE '[0-9]+')"
+_cases="$(grep -cE '^\s+case [0-9]+: draw|^\s+case [0-9]+: live' "$SRCD/Visualiser.swift" 2>/dev/null)"
+# modeCount must match the number of cases plus the default arm, or clicking
+# cycles into a mode that renders nothing.
+if [ -n "$_mc" ] && [ "$_mc" -eq $(( _cases + 1 )) ]; then
+  pass "every analyser mode the click cycle reaches is drawable ($_mc modes)"
+else
+  fail "every analyser mode the click cycle reaches is drawable" "modeCount=$_mc cases=$_cases"
+fi
 grep -q 'drawNeon' "$SRCD/Visualiser.swift" 2>/dev/null \
   && pass "the analyser has the neon wave field" \
   || fail "the analyser has the neon wave field"
