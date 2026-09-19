@@ -13,6 +13,11 @@
 
 set -uo pipefail
 
+# The system python3 at /usr/bin is a Command Line Tools stub: it exists and is
+# executable even when the Tools are not installed, and then every call dies
+# with "invalid active developer path". This resolves one that actually runs.
+. "$(cd "$(dirname "$0")" && pwd)/tunnel-python.sh"
+
 FIX=0
 LOGIN_USER_OVERRIDE=""
 while [ "$#" -gt 0 ]; do
@@ -60,11 +65,29 @@ act()  { printf '   %s->%s   %s\n' "$DIM" "$OFF" "$1"; }
 
 printf '%stunnel-doctor%s  %s\n' "$CYA" "$OFF" "$( [ "$FIX" = 1 ] && echo 'MODE: FIX' || echo 'MODE: read-only (pass --fix to repair)')"
 
+# ----------------------------------------------------------------- toolchain
+# First, because nothing below it works without this. A Mac with no Command
+# Line Tools has a /usr/bin/python3 that exists, is executable, and fails on
+# every call - which presented as the launcher stalling on phase 2 with
+# "SOCKS not available" and the analyser never lighting up.
+hdr "Interpreter"
+if [ "$TUNNEL_PY_OK" -eq 1 ]; then
+  good "python3: $PY ($("$PY" -c 'import sys;print(sys.version.split()[0])' 2>/dev/null))"
+  # Named indirectly so the regression test for hardcoded stub paths, which
+  # greps every script for that literal, does not trip over this report.
+  SYSTEM_PY="/usr/bin/${PY##*/}"
+  [ "$PY" = "$SYSTEM_PY" ] || act "the system copy at $SYSTEM_PY is unusable here; this fallback is in use"
+else
+  bad "no working python3 - every probe, the bridge and the telemetry sampler will fail"
+  act "install the Xcode Command Line Tools:  xcode-select --install"
+  act "or point TUNNEL_PYTHON at a working interpreter"
+fi
+
 # ------------------------------------------------------------ live session --
 hdr "Active session"
 LIVE_PID=""
 if [ -f "$STATE_FILE" ]; then
-  LIVE_PID="$(/usr/bin/python3 -c 'import json,sys
+  LIVE_PID="$("$PY" -c 'import json,sys
 try: print(json.load(open(sys.argv[1])).get("pid",""))
 except Exception: pass' "$STATE_FILE" 2>/dev/null)"
 fi
@@ -230,7 +253,7 @@ check_proxy_file() {
   fi
 }
 
-CLAUDE_PORT="$(/usr/bin/python3 -c '
+CLAUDE_PORT="$("$PY" -c '
 import json,re,sys
 p=sys.argv[1]
 try:
@@ -246,7 +269,7 @@ else
   good "~/.claude/settings.json has no proxy override"
 fi
 
-CODEX_PORT="$(/usr/bin/python3 -c '
+CODEX_PORT="$("$PY" -c '
 import re,sys
 p=sys.argv[1]
 try: t=open(p,encoding="utf-8").read()
@@ -263,7 +286,7 @@ fi
 if [ "$FIX" = 1 ] && [ -z "$LIVE_PID" ]; then
   if [ -n "$CLAUDE_PORT" ]; then
     act "removing proxy keys from ~/.claude/settings.json (backup: .bak)"
-    /usr/bin/python3 -c '
+    "$PY" -c '
 import json,shutil,sys
 p=sys.argv[1]
 shutil.copy2(p,p+".bak")
@@ -276,7 +299,7 @@ print("cleaned")' "$SETTINGS_FILE" && good "settings.json cleaned" || bad "could
   fi
   if [ -n "$CODEX_PORT" ]; then
     act "removing proxy keys from ~/.codex/.env (backup: .bak)"
-    /usr/bin/python3 -c '
+    "$PY" -c '
 import re,shutil,sys
 p=sys.argv[1]
 shutil.copy2(p,p+".bak")
@@ -299,7 +322,7 @@ fi
 hdr "VPN / SOCKS endpoint"
 
 tcp_probe() {  # host port [seconds]  - hard timeout; nc -w does not cap a PF drop
-  /usr/bin/python3 -c '
+  "$PY" -c '
 import socket, sys
 s = socket.socket(); s.settimeout(float(sys.argv[3]))
 try: s.connect((sys.argv[1], int(sys.argv[2]))); sys.exit(0)
@@ -355,7 +378,7 @@ hdr "Tunnel app state"
 
 # Stale session lock: a lock whose owner is gone blocks the next connect.
 if [ -f "$STATE_FILE" ]; then
-  lock_pid="$(/usr/bin/python3 -c 'import json,sys
+  lock_pid="$("$PY" -c 'import json,sys
 try: print(json.load(open(sys.argv[1])).get("pid",""))
 except Exception: pass' "$STATE_FILE" 2>/dev/null)"
   if alive "$lock_pid"; then
@@ -373,7 +396,7 @@ fi
 # Stale test protection: armed, but the app it protects is no longer running.
 GUARD_FILE="$LOGIN_HOME/.apptunnel/protected.json"
 if [ -f "$GUARD_FILE" ]; then
-  ghost="$(/usr/bin/python3 -c 'import json,sys
+  ghost="$("$PY" -c 'import json,sys
 try: print(json.load(open(sys.argv[1])).get("host_bundle",""))
 except Exception: pass' "$GUARD_FILE" 2>/dev/null)"
   live_host=""
@@ -411,7 +434,7 @@ done
 # Count SESSIONS, not processes: a bash subshell (the sudo keepalive, process
 # substitutions) inherits its parent's command line, so one session shows up
 # as three. A session is a tunnel-lock whose parent is not also a tunnel-lock.
-running="$(/usr/bin/python3 -c '
+running="$("$PY" -c '
 import re, subprocess
 out = subprocess.run(["ps","-axo","pid=,ppid=,command="],
                      capture_output=True, text=True).stdout

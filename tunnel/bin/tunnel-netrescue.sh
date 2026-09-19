@@ -26,6 +26,11 @@
 
 set -uo pipefail
 
+# The system python3 at /usr/bin is a Command Line Tools stub: it exists and is
+# executable even when the Tools are not installed, and then every call dies
+# with "invalid active developer path". This resolves one that actually runs.
+. "$(cd "$(dirname "$0")" && pwd)/tunnel-python.sh"
+
 BIN="$(cd "$(dirname "$0")" && pwd)"
 BACKUP_DIR="$HOME/.apptunnel/netbackup"
 SC_DIR="/Library/Preferences/SystemConfiguration"
@@ -55,7 +60,7 @@ dns_works() { [ -n "$(dig +time=3 +tries=1 +short www.wikipedia.org @1.1.1.1 2>/
 # probe from inside a guarded group hangs — precisely when this tool is needed.
 # Python enforces a hard timeout.
 tcp_probe() {  # tcp_probe HOST PORT [SECONDS]
-  /usr/bin/python3 -c '
+  "$PY" -c '
 import socket, sys
 s = socket.socket(); s.settimeout(float(sys.argv[3]) if len(sys.argv) > 3 else 2.0)
 try:

@@ -11,59 +11,6 @@
 import AppKit
 import Foundation
 
-// MARK: - Skin
-
-enum Skin {
-    static let metalHi   = NSColor(srgbRed: 0.40, green: 0.40, blue: 0.47, alpha: 1)
-    static let metal     = NSColor(srgbRed: 0.235, green: 0.235, blue: 0.275, alpha: 1)
-    static let metalLo   = NSColor(srgbRed: 0.145, green: 0.145, blue: 0.180, alpha: 1)
-    static let metalDeep = NSColor(srgbRed: 0.055, green: 0.055, blue: 0.075, alpha: 1)
-    static let green     = NSColor(srgbRed: 0.000, green: 1.000, blue: 0.298, alpha: 1)
-    static let greenMid  = NSColor(srgbRed: 0.000, green: 0.720, blue: 0.220, alpha: 1)
-    static let greenDim  = NSColor(srgbRed: 0.000, green: 0.380, blue: 0.130, alpha: 1)
-    static let amber     = NSColor(srgbRed: 1.000, green: 0.780, blue: 0.150, alpha: 1)
-    static let red       = NSColor(srgbRed: 1.000, green: 0.290, blue: 0.170, alpha: 1)
-    static let label     = NSColor(srgbRed: 0.66, green: 0.66, blue: 0.74, alpha: 1)
-    static let lcd       = NSColor(srgbRed: 0.02, green: 0.03, blue: 0.02, alpha: 1)
-
-    static func mono(_ s: CGFloat, _ bold: Bool = false) -> NSFont {
-        NSFont.monospacedSystemFont(ofSize: s, weight: bold ? .bold : .regular)
-    }
-}
-
-func bevel(_ r: NSRect, sunken: Bool = false) {
-    let hi = sunken ? Skin.metalDeep : Skin.metalHi
-    let lo = sunken ? Skin.metalHi : Skin.metalDeep
-    hi.setFill()
-    NSRect(x: r.minX, y: r.maxY - 1, width: r.width, height: 1).fill()
-    NSRect(x: r.minX, y: r.minY, width: 1, height: r.height).fill()
-    lo.setFill()
-    NSRect(x: r.minX, y: r.minY, width: r.width, height: 1).fill()
-    NSRect(x: r.maxX - 1, y: r.minY, width: 1, height: r.height).fill()
-}
-
-func text(_ s: String, _ p: NSPoint, _ f: NSFont, _ c: NSColor, glow: CGFloat = 0) {
-    var a: [NSAttributedString.Key: Any] = [.font: f, .foregroundColor: c]
-    if glow > 0 {
-        let sh = NSShadow()
-        sh.shadowColor = c.withAlphaComponent(glow)
-        sh.shadowBlurRadius = 5
-        sh.shadowOffset = .zero
-        a[.shadow] = sh
-    }
-    (s as NSString).draw(at: p, withAttributes: a)
-}
-
-func width(_ s: String, _ f: NSFont) -> CGFloat {
-    (s as NSString).size(withAttributes: [.font: f]).width
-}
-
-/// Frame-rate independent easing toward a target.
-func ease(_ cur: inout CGFloat, _ target: CGFloat, _ rate: CGFloat = 0.22) {
-    cur += (target - cur) * rate
-    if abs(target - cur) < 0.0005 { cur = target }
-}
-
 // MARK: - Model
 
 struct PhaseDef { let name: String; let label: String }
@@ -112,6 +59,8 @@ final class Model {
     var socksPort: UInt16 = 1080
     /// Bundles currently running inside the tunnel's isolation group.
     var tunnelled: Set<String> = []
+    let telemetry = TelemetryStore()
+    let net = ThroughputMeter()
     var runFile: String { stateDir + "/run-request" }
     private var scanTick = 0
     var startedAt: Date?
@@ -181,6 +130,8 @@ final class Model {
             if before != tunnelled { dirty = true }
         }
         if !demoMode && consumeEvents() { dirty = true }
+        if !demoMode && telemetry.poll() { dirty = true }
+        if net.sample() { dirty = true }
         return dirty
     }
 
@@ -393,76 +344,6 @@ final class TitleBar: NSView {
 
 // MARK: - Visualiser (bars + oscilloscope, click to toggle)
 
-final class Visualiser: NSView {
-    private let n = 19
-    private var lv: [CGFloat]
-    private var pk: [CGFloat]
-    private var wave = [CGFloat](repeating: 0, count: 76)
-    private var t: CGFloat = 0
-    var scopeMode = false
-
-    override init(frame f: NSRect) {
-        lv = .init(repeating: 0, count: n); pk = .init(repeating: 0, count: n)
-        super.init(frame: f)
-        toolTip = "Click to switch between analyser and oscilloscope"
-    }
-    required init?(coder: NSCoder) { fatalError() }
-
-    override func mouseDown(with e: NSEvent) { scopeMode.toggle(); needsDisplay = true }
-
-    func step() {
-        let m = Model.shared
-        let live = m.sessionActive || m.demoMode || m.connecting
-        let energy: CGFloat = live ? 0.25 + CGFloat(m.completed) / CGFloat(PHASES.count) * 0.75 : 0.04
-        for i in 0..<n {
-            let base = sin(t / 6.5 + CGFloat(i) / 1.9) * 0.38 + 0.5
-            let tilt = 1 - CGFloat(i) / CGFloat(n) / 1.6
-            let target = live ? max(0, base * energy * tilt + CGFloat.random(in: 0...0.2) * energy)
-                              : CGFloat.random(in: 0...0.04)
-            ease(&lv[i], target, 0.34)
-            pk[i] = max(pk[i] - 0.011, lv[i])
-        }
-        for i in 0..<wave.count {
-            let x = CGFloat(i) / CGFloat(wave.count)
-            wave[i] = live
-                ? sin(x * 12 + t / 4) * 0.34 * energy + sin(x * 27 - t / 6) * 0.2 * energy
-                : sin(x * 6 + t / 9) * 0.02
-        }
-        t += 1
-        needsDisplay = true
-    }
-
-    override func draw(_ r: NSRect) {
-        Skin.lcd.setFill(); bounds.fill()
-        if scopeMode {
-            let mid = bounds.midY
-            let path = NSBezierPath(); path.lineWidth = 1
-            for i in 0..<wave.count {
-                let x = bounds.minX + CGFloat(i) / CGFloat(wave.count - 1) * bounds.width
-                let y = mid + wave[i] * (bounds.height / 2 - 2)
-                i == 0 ? path.move(to: NSPoint(x: x, y: y)) : path.line(to: NSPoint(x: x, y: y))
-            }
-            Skin.green.setStroke(); path.stroke()
-        } else {
-            let bw = bounds.width / CGFloat(n)
-            let h = bounds.height - 3
-            for i in 0..<n {
-                let x = CGFloat(i) * bw + 1
-                var y: CGFloat = 1
-                let bh = max(1, lv[i] * h)
-                while y < bh {
-                    let f = y / h
-                    (f > 0.74 ? Skin.red : f > 0.46 ? Skin.amber : Skin.green)
-                        .withAlphaComponent(0.5 + f * 0.5).setFill()
-                    NSRect(x: x, y: y, width: bw - 2, height: 1).fill()
-                    y += 2
-                }
-                NSColor(white: 0.75, alpha: 0.85).setFill()
-                NSRect(x: x, y: 1 + pk[i] * h, width: bw - 2, height: 1).fill()
-            }
-        }
-    }
-}
 
 // MARK: - Main LCD
 
@@ -476,7 +357,9 @@ final class LCD: NSView {
 
         var clock = "--:--"
         if let s = m.startedAt {
-            let t = Int(Date().timeIntervalSince(s))
+            // Wall time makes a snapshot flap between e.g. 02:14 and 02:15
+            // depending on when the render lands. Pin it when deterministic.
+            let t = Render.deterministic ? 134 : Int(Date().timeIntervalSince(s))
             clock = String(format: "%02d:%02d", t / 60, t % 60)
         }
         text(clock, NSPoint(x: 8, y: 32), Skin.mono(24, true),
@@ -818,6 +701,9 @@ final class LogWindow: NSWindow {
 
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
+    /// Command-W closes the panel rather than beeping (no .closable in the mask)
+    /// and must NOT quit the app - only the main window means that.
+    override func performClose(_ sender: Any?) { close() }
     func append(_ s: String) { tv.string += s; tv.scrollToEndOfDocument(nil) }
 }
 
@@ -854,13 +740,19 @@ final class Main: NSWindow {
         layout()
         center()
 
-        Timer.scheduledTimer(withTimeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
-            self?.vis.step(); self?.lcd.advance(); self?.bars.step(); self?.pos.step()
-            self?.pulseLED()
+        // Snapshot modes drive the views explicitly with a fixed step count.
+        // Letting the timers also run made an indeterminate number of extra
+        // frames land before capture, so no two renders matched.
+        if !Render.deterministic {
+            Timer.scheduledTimer(withTimeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
+                self?.vis.step(); self?.lcd.advance(); self?.bars.step(); self?.pos.step()
+                self?.pulseLED()
+            }
+            Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in
+                if Model.shared.poll() { self?.refresh() }
+    
         }
-        Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in
-            if Model.shared.poll() { self?.refresh() }
-        }
+    }
     }
 
     private var ledPhase: CGFloat = 0
@@ -884,6 +776,7 @@ final class Main: NSWindow {
 
         y -= 66
         vis.frame = NSRect(x: 8, y: y, width: 170, height: 62)
+        vis.onHover = { [weak self] t in self?.showHint(t) }
         root.addSubview(vis)
         lcd.frame = NSRect(x: 182, y: y, width: W - 190, height: 62)
         root.addSubview(lcd)
@@ -1314,6 +1207,11 @@ final class Main: NSWindow {
 
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
+
+    /// Command-W. A borderless window has no close button, so the stock
+    /// performClose: would just beep. This is the single window of the app, and
+    /// the painted X quits, so Command-W means the same thing.
+    override func performClose(_ sender: Any?) { NSApp.terminate(nil) }
 }
 
 // MARK: - Delegate
@@ -1322,6 +1220,18 @@ final class Delegate: NSObject, NSApplicationDelegate {
     var win: Main?
 
     func applicationDidFinishLaunching(_ n: Notification) {
+        // Before anything that can show an alert: without a main menu there are
+        // no key equivalents at all, so Command-Q is dead even on the error path.
+        AppMenu.install()
+
+        // Lets the suite prove the shortcuts are really bound, rather than
+        // grepping the source and hoping. Prints one "title<tab>modifiers+key"
+        // line per item and exits.
+        if CommandLine.arguments.contains("--dump-menu") {
+            print(AppMenu.describe())
+            exit(0)
+        }
+
         let m = Model.shared
         var dir = (Bundle.main.bundlePath as NSString).deletingLastPathComponent
         let fm = FileManager.default
@@ -1346,9 +1256,52 @@ final class Delegate: NSObject, NSApplicationDelegate {
         w.makeKeyAndOrderFront(nil)
         w.refresh()
         win = w
-        NSApp.activate(ignoringOtherApps: true)
+        comeToFront(w)
 
         let args = CommandLine.arguments
+        // Any snapshot mode renders deterministically so the suite can compare.
+        if args.contains(where: { $0.hasPrefix("--snapshot") }) {
+            Render.deterministic = true
+            Render.reseed()
+        }
+        // Deterministic telemetry render for the suite: synthetic values, no
+        // live session required.
+        if let i = args.firstIndex(of: "--snapshot-eq"), i + 1 < args.count {
+            let out = args[i + 1]
+            // Optional 3rd arg: synthetic FLOW, so the suite can capture the
+            // display both idle and under load.
+            let synthFlow = (i + 3 < args.count ? Double(args[i + 3]) : nil) ?? 0.34
+            let synthetic = """
+            {"t": \(Date().timeIntervalSince1970),
+             "link":1.0,"dns":0.92,"socks":1.0,"bridge":0.88,"exit":1.0,
+             "rtt":0.61,"flow":\(synthFlow),"seal":1.0,"wall":1.0,"grip":1.0,
+             "score":0.93,"exit_ip":"91.207.57.102",
+             "detail":{"link":"gateway 192.168.85.229","dns":"48ms","socks":"127.0.0.1:1080 6ms",
+                       "bridge":"12ms","exit":"91.207.57.102","rtt":"180ms","flow":"3 conn",
+                       "seal":"0/3 reachable","wall":"60 rules","grip":"14 inside"}}
+            """
+            let dir = NSHomeDirectory() + "/.apptunnel"
+            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            try? synthetic.write(toFile: dir + "/telemetry.json", atomically: true, encoding: .utf8)
+            m.sessionActive = true
+            _ = m.telemetry.poll()
+            // Optional trailing arg picks the analyser mode to capture.
+            if i + 2 < args.count, let md = Int(args[i + 2]) { w.vis.mode = md }
+            if i + 3 < args.count, let fl = Double(args[i + 3]) { m.net.pinned = fl }
+            for _ in 0..<120 { w.vis.step() }
+            w.refresh()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                if let v = w.contentView, let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) {
+                    v.cacheDisplay(in: v.bounds, to: rep)
+                    if let d = rep.representation(using: .png, properties: [:]) {
+                        try? d.write(to: URL(fileURLWithPath: out))
+                        FileHandle.standardError.write("eq snapshot: \(out)\n".data(using: .utf8)!)
+                    }
+                }
+                NSApp.terminate(nil)
+            }
+            return
+        }
         if let i = args.firstIndex(of: "--snapshot-log"), i + 1 < args.count {
             let out = args[i + 1]
             let sample = """
@@ -1389,6 +1342,32 @@ final class Delegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Raise the window on Sonoma, where the old incantation stopped working.
+    ///
+    /// macOS 14 deprecated `activate(ignoringOtherApps:)` and, more to the
+    /// point, made the "ignoring" half a no-op: an app that was not started by
+    /// a user gesture is no longer allowed to steal focus. This app IS started
+    /// that way - the launcher spawns it from a detached shell - so on Sonoma
+    /// the window was created, ordered front within our own (inactive) app, and
+    /// left sitting behind everything else. From the user's side the app simply
+    /// did not appear.
+    ///
+    /// `orderFrontRegardless()` is the part that still works unconditionally:
+    /// it puts the window above other applications' windows without requiring
+    /// activation. The activate call is kept for the keyboard focus, using the
+    /// modern spelling where it exists, and is repeated once on the next runloop
+    /// pass because the launcher's own activation can land a beat after ours.
+    private func comeToFront(_ w: NSWindow) {
+        func raise() {
+            if #available(macOS 14.0, *) { NSApp.activate() }
+            else { NSApp.activate(ignoringOtherApps: true) }
+            w.orderFrontRegardless()
+            w.makeKey()
+        }
+        raise()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { raise() }
+    }
+
     private func snapshot(_ w: Main, to out: String) {
         let m = Model.shared
         m.demoMode = true; m.socksUp = true
@@ -1421,6 +1400,20 @@ final class Delegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ a: NSApplication) -> Bool { false }
+
+    /// Sonoma logs a warning on every launch when this is unanswered, and opts
+    /// the app into the legacy insecure restorable-state path. We restore
+    /// nothing from disk, so the secure coder is simply correct here.
+    @available(macOS 12.0, *)
+    func applicationSupportsSecureRestorableState(_ a: NSApplication) -> Bool { true }
+
+    /// Clicking the Dock icon with the window hidden or minimised must bring it
+    /// back. Without this the app looks gone while still running, because
+    /// terminate-after-last-window is off.
+    func applicationShouldHandleReopen(_ a: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if let w = win { comeToFront(w) }
+        return true
+    }
 }
 
 let app = NSApplication.shared

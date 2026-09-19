@@ -14,6 +14,11 @@
 #   tunnel-dnsguard.sh --fix    flush the offending anchors
 
 set -uo pipefail
+
+# The system python3 at /usr/bin is a Command Line Tools stub: it exists and is
+# executable even when the Tools are not installed, and then every call dies
+# with "invalid active developer path". This resolves one that actually runs.
+. "$(cd "$(dirname "$0")" && pwd)/tunnel-python.sh"
 FIX=0
 [ "${1:-}" = "--fix" ] && FIX=1
 
@@ -71,7 +76,7 @@ echo
 echo "############ 4. VERIFY ############"
 [ -n "$(dig +time=4 +tries=1 +short www.wikipedia.org @1.1.1.1 2>/dev/null)" ] \
   && echo "  uncached DNS : OK" || echo "  uncached DNS : STILL BLOCKED"
-/usr/bin/python3 -c "
+"$PY" -c "
 import socket,sys
 s=socket.socket(); s.settimeout(3)
 try: s.connect(('1.1.1.1',443)); sys.exit(0)

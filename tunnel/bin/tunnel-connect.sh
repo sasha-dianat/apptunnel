@@ -14,6 +14,11 @@
 
 set -uo pipefail
 
+# The system python3 at /usr/bin is a Command Line Tools stub: it exists and is
+# executable even when the Tools are not installed, and then every call dies
+# with "invalid active developer path". This resolves one that actually runs.
+. "$(cd "$(dirname "$0")" && pwd)/tunnel-python.sh"
+
 BIN="$(cd "$(dirname "$0")" && pwd)"
 LOGIN_USER=""
 APPS=()
@@ -48,7 +53,7 @@ GUARD="$LOGIN_HOME/.apptunnel/protected.json"
 
 protected_pids() {
   [ -f "$GUARD" ] || return 0
-  /usr/bin/python3 -c '
+  "$PY" -c '
 import json, sys
 try: print(" ".join(str(p) for p in json.load(open(sys.argv[1])).get("pids", [])))
 except Exception: pass
@@ -73,6 +78,57 @@ drop_protected() {   # reads pids on stdin, prints ONLY the ones safe to signal
 
 # Defence in depth: strip anything that is not a bare pid.
 only_pids() { awk '/^[0-9]+$/{print}'; }
+
+# Preconditions BEFORE destruction.
+#
+# This script's first act used to be killing every legacy launcher; only then
+# did tunnel-lock.sh ask, at phase 2 of 10, whether a SOCKS5 endpoint existed at
+# all. Pressing Run while the VPN was down therefore tore down a working tunnel
+# and quit every app inside it, and then failed anyway - the user lost a working
+# session and gained nothing. The endpoint is now proven first, and nothing is
+# signalled until it is.
+#
+# Discovery mirrors tunnel-lock.sh phase 2: ask the system proxy where the VPN
+# put its listener, then try the ports VPN clients commonly use.
+require_socks_endpoint() {
+  local dump enable host port cand
+  dump="$(/usr/sbin/scutil --proxy 2>/dev/null || true)"
+  enable="$(printf '%s\n' "$dump" | awk '/SOCKSEnable[[:space:]]*:/{print $3; exit}')"
+  host="$(printf '%s\n'  "$dump" | awk '/SOCKSProxy[[:space:]]*:/{print $3; exit}')"
+  port="$(printf '%s\n'  "$dump" | awk '/SOCKSPort[[:space:]]*:/{print $3; exit}')"
+  if [ "$enable" != "1" ] || [ -z "$host" ] || [ -z "$port" ]; then host="127.0.0.1"; port=""; fi
+
+  for cand in ${port:+$port} 1080 1180 1081 7890 1086; do
+    if "$PY" -c '
+import socket, sys
+s = socket.socket(); s.settimeout(2)
+try: s.connect((sys.argv[1], int(sys.argv[2]))); sys.exit(0)
+except Exception: sys.exit(1)
+finally: s.close()
+' "$host" "$cand" 2>/dev/null; then
+      stamp "SOCKS5 endpoint present at $host:$cand"
+      return 0
+    fi
+  done
+  return 1
+}
+
+if ! require_socks_endpoint; then
+  stamp "no SOCKS5 endpoint reachable - nothing was stopped"
+  cat >&2 <<MSG
+
+ERROR: No SOCKS5 listener found, so the tunnel was not started.
+
+Nothing was stopped and no app was quit. Any session you already had is
+still running, exactly as it was.
+
+Bring the VPN tunnel up first, then press Run again:
+
+    $BIN/tunnel-veepn-repair.sh
+
+MSG
+  exit 3
+fi
 
 stamp "checking for legacy launcher sessions"
 # Supervisors first, so they cannot respawn the launchers we are about to stop.

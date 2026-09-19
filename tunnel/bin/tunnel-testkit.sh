@@ -24,6 +24,11 @@
 
 set -uo pipefail
 
+# The system python3 at /usr/bin is a Command Line Tools stub: it exists and is
+# executable even when the Tools are not installed, and then every call dies
+# with "invalid active developer path". This resolves one that actually runs.
+. "$(cd "$(dirname "$0")" && pwd)/tunnel-python.sh"
+
 BIN="$(cd "$(dirname "$0")" && pwd)"
 STATE_DIR="$HOME/.apptunnel"
 GUARD="$STATE_DIR/protected.json"
@@ -79,7 +84,7 @@ cmd_protect() {
     extra="$(ps -axo pid=,command= | awk -v b="$bundle/Contents/" 'index($0,b){print $1}' | tr '\n' ' ')"
   fi
 
-  /usr/bin/python3 -c '
+  "$PY" -c '
 import json, os, sys, time
 guard, bundle = sys.argv[1], sys.argv[2]
 pids = sorted({int(x) for x in (sys.argv[3] + " " + sys.argv[4]).split() if x.isdigit()})
@@ -101,8 +106,8 @@ cmd_status() {
   hdr "Protection status"
   if [ ! -f "$GUARD" ]; then ok "not armed — normal behaviour"; return 0; fi
   local bundle pids p alive=0 total=0
-  bundle="$(/usr/bin/python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("host_bundle") or "")' "$GUARD")"
-  pids="$(/usr/bin/python3 -c 'import json,sys;print(" ".join(str(p) for p in json.load(open(sys.argv[1])).get("pids",[])))' "$GUARD")"
+  bundle="$("$PY" -c 'import json,sys;print(json.load(open(sys.argv[1])).get("host_bundle") or "")' "$GUARD")"
+  pids="$("$PY" -c 'import json,sys;print(" ".join(str(p) for p in json.load(open(sys.argv[1])).get("pids",[])))' "$GUARD")"
   ok "host bundle: ${bundle:-none}"
   for p in $pids; do
     total=$((total + 1))
@@ -120,7 +125,7 @@ cmd_clear() {
 
 is_protected() {   # is_protected PID
   [ -f "$GUARD" ] || return 1
-  /usr/bin/python3 -c '
+  "$PY" -c '
 import json, sys
 try: g = json.load(open(sys.argv[1]))
 except Exception: sys.exit(1)
@@ -146,8 +151,8 @@ cmd_preview() {
   [ "$found" -eq 0 ] && ok "nothing to stop"
   echo
   hdr "Roster"
-  local bundle; bundle="$( [ -f "$GUARD" ] && /usr/bin/python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("host_bundle") or "")' "$GUARD" || echo "")"
-  /usr/bin/python3 -c '
+  local bundle; bundle="$( [ -f "$GUARD" ] && "$PY" -c 'import json,sys;print(json.load(open(sys.argv[1])).get("host_bundle") or "")' "$GUARD" || echo "")"
+  "$PY" -c '
 import json, os, sys
 b = sys.argv[2]
 try: r = json.load(open(sys.argv[1]))

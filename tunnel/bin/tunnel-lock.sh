@@ -40,6 +40,11 @@
 
 set -euo pipefail
 
+# The system python3 at /usr/bin is a Command Line Tools stub: it exists and is
+# executable even when the Tools are not installed, and then every call dies
+# with "invalid active developer path". This resolves one that actually runs.
+. "$(cd "$(dirname "$0")" && pwd)/tunnel-python.sh"
+
 VERSION="2.1"
 # Defaults only. The real endpoint is discovered from the system proxy
 # configuration, which the VPN client itself writes: VeePN uses 1180 on some
@@ -49,17 +54,22 @@ SOCKS_HOST="127.0.0.1"
 SOCKS_PORT="1080"
 SOCKS_HOST_SET=0
 SOCKS_PORT_SET=0
-# Per-session anchor. A single shared anchor name meant a second run's teardown
-# flushed the FIRST run's rules, silently disarming a live session's firewall.
-# tunnel-doctor globs apptunnel-* so orphans stay discoverable.
-ANCHOR="com.apple/apptunnel-$$"
+# Fixed anchor. A surviving app must still be covered when the tunnel is rebuilt
+# after a disconnect, so the anchor cannot be per-session. The original reason
+# for keying it to $$ was that a second run's teardown flushed the first run's
+# rules; that is now prevented by STATE_FILE enforcing a single launcher, which
+# is what makes one shared anchor safe. tunnel-doctor globs apptunnel* so
+# orphans stay discoverable.
+ANCHOR="com.apple/apptunnel"
 STATE_DIR="$HOME/.apptunnel"
 EVENT_LOG="$STATE_DIR/events.jsonl"
 STATE_FILE="$STATE_DIR/session.json"
 STOP_FILE="$STATE_DIR/stop"
 RUN_FILE="$STATE_DIR/run-request"
+TELEMETRY_FILE="$STATE_DIR/telemetry.json"
+TELEMETRY_LOCK="$STATE_DIR/telemetry.lock"
 
-GROUP_NAME="apptun$$"
+GROUP_NAME="apptunnel"
 GROUP_GID=""
 PF_TOKEN=""
 PF_ENABLED_BY_US=0
@@ -69,7 +79,10 @@ SETTINGS_PATCHED=0
 CODEX_ENV_PATCHED=0
 SUDO_KEEPALIVE_PID=""
 BRIDGE_PID=""
-BRIDGE_PORT=""
+# Fixed: an app's HTTP_PROXY is baked into its environment at exec and cannot be
+# changed afterward, so a rebuilt bridge MUST return on the same port or every
+# surviving app is left pointing at a dead one.
+BRIDGE_PORT="${TUNNEL_BRIDGE_PORT:-17080}"
 CLEANUP_PROBLEMS=0
 STATE_OWNED=0
 LOGIN_USER_OVERRIDE=""
@@ -109,7 +122,7 @@ CUR_NAME="INIT"
 # Machine-readable phase events consumed by the GUI's animation.
 emit() {
   local n="$1" name="$2" status="$3" msg="${4:-}"
-  /usr/bin/python3 -c 'import json,sys,time
+  "$PY" -c 'import json,sys,time
 print(json.dumps({"t":time.time(),"phase":int(sys.argv[1]),"name":sys.argv[2],
                   "status":sys.argv[3],"msg":sys.argv[4]}), flush=True)' \
     "$n" "$name" "$status" "$msg" >> "$EVENT_LOG" 2>/dev/null || true
@@ -171,7 +184,7 @@ prepare_user_config_access() {
   done
 
   if [ -e "$SETTINGS_FILE" ]; then
-    /usr/bin/python3 - "$SETTINGS_FILE" <<'PY' \
+    "$PY" - "$SETTINGS_FILE" <<'PY' \
       || die "Claude settings are not valid JSON: $SETTINGS_FILE"
 import json, sys
 with open(sys.argv[1], encoding="utf-8") as handle:
@@ -271,7 +284,7 @@ note_problem() {
 restore_settings() {
   (( SETTINGS_PATCHED )) || return 0
   [ -f "$SETTINGS_STATE" ] || return 0
-  if /usr/bin/python3 - "$SETTINGS_FILE" "$SETTINGS_STATE" <<'PY'
+  if "$PY" - "$SETTINGS_FILE" "$SETTINGS_STATE" <<'PY'
 import json, os, sys, tempfile
 settings_path, state_path = sys.argv[1:3]
 with open(state_path) as f:
@@ -311,7 +324,7 @@ PY
 restore_codex_env() {
   (( CODEX_ENV_PATCHED )) || return 0
   [ -f "$CODEX_ENV_STATE" ] || return 0
-  if /usr/bin/python3 - "$CODEX_ENV_FILE" "$CODEX_ENV_STATE" <<'PY'
+  if "$PY" - "$CODEX_ENV_FILE" "$CODEX_ENV_STATE" <<'PY'
 import json, os, re, sys, tempfile
 env_path, state_path = sys.argv[1:3]
 with open(state_path, encoding="utf-8") as f:
@@ -359,12 +372,12 @@ cleanup() {
   trap - EXIT INT TERM HUP
   emit 98 TEARDOWN run "restoring system state"
 
-  local pid
-  for pid in ${APP_WRAPPER_PIDS[@]+"${APP_WRAPPER_PIDS[@]}"}; do
-    if kill -0 "$pid" 2>/dev/null; then
-      kill -TERM "$pid" 2>/dev/null || true
-    fi
-  done
+  # Deliberately does NOT signal the tunnelled apps. Dropping PF and the bridge
+  # already denies them the network, which is the property the guard exists to
+  # provide. Killing them as well destroyed live Claude/Codex sessions on every
+  # transient failure, and is what forced a relaunch after each reconnect. The
+  # apps stay up, keep their gid, and re-adopt the tunnel when it returns.
+  # tunnel-quit.sh is the one path that closes them, on purpose.
 
   restore_settings
   restore_codex_env
@@ -388,16 +401,15 @@ cleanup() {
     fi
   fi
 
-  if (( GROUP_CREATED )); then
-    sudo -n /usr/sbin/dseditgroup -o edit -d "$LOGIN_USER" -t user "$GROUP_NAME" >/dev/null 2>&1 || true
-    sudo -n /usr/sbin/dseditgroup -o delete "$GROUP_NAME" >/dev/null 2>&1 \
-      || note_problem "temporary group $GROUP_NAME not deleted. Run: sudo dseditgroup -o delete $GROUP_NAME"
-  fi
+  # The group is persistent: a surviving app is only still reachable on the next
+  # connect because its gid did not change. retire_orphaned_state deletes it at
+  # the next connect if no process is left in it, and tunnel-quit.sh deletes it
+  # after closing the apps.
 
   [ -n "$SUDO_KEEPALIVE_PID" ] && kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
   # Only ever remove the lock we ourselves claimed.
   (( STATE_OWNED )) && rm -f "$STATE_FILE" 2>/dev/null
-  rm -f "$STOP_FILE" "$RUN_FILE" 2>/dev/null
+  rm -f "$STOP_FILE" "$RUN_FILE" "$TELEMETRY_FILE" "$TELEMETRY_LOCK" 2>/dev/null
   true
   rm -rf "$TMPROOT" 2>/dev/null || true
 
@@ -451,6 +463,8 @@ if [ "$EUID" -eq 0 ]; then
   STATE_FILE="$STATE_DIR/session.json"
   STOP_FILE="$STATE_DIR/stop"
   RUN_FILE="$STATE_DIR/run-request"
+  TELEMETRY_FILE="$STATE_DIR/telemetry.json"
+  TELEMETRY_LOCK="$STATE_DIR/telemetry.lock"
   SETTINGS_FILE="$LOGIN_HOME/.claude/settings.json"
   CODEX_ENV_FILE="$LOGIN_HOME/.codex/.env"
 elif [ -n "$LOGIN_USER_OVERRIDE" ]; then
@@ -474,9 +488,14 @@ phase 1 PREFLIGHT "checking environment and app bundles"
 
 [ "$(uname -s)" = "Darwin" ] || die "macOS only."
 
-for cmd in pfctl curl ifconfig sudo awk python3 nc ps osascript; do
+for cmd in pfctl curl ifconfig sudo awk nc ps osascript; do
   command -v "$cmd" >/dev/null 2>&1 || die "Required command '$cmd' not found."
 done
+# python3 is checked separately and by RUNNING it, not by command -v. The system
+# copy is an xcrun stub that answers "yes, I exist" and then fails on every
+# call, which is how a machine with no Command Line Tools got all the way to
+# phase 2 before stalling with an unexplained "SOCKS not available".
+[ "$TUNNEL_PY_OK" -eq 1 ] || die "No working python3. Install the Command Line Tools: xcode-select --install"
 [ -x /usr/sbin/dseditgroup ] || die "dseditgroup not found."
 [ -x /usr/bin/dscl ] || die "dscl not found."
 
@@ -491,7 +510,7 @@ fi
 # "already running?" test; the second run then tore down the first run's
 # firewall rules and reported the first run's app as "not in the isolation
 # group", because it was comparing against its OWN gid.
-lock_result="$(/usr/bin/python3 -c '
+lock_result="$("$PY" -c '
 import json, os, sys
 path, mypid = sys.argv[1], int(sys.argv[2])
 def claim():
@@ -524,7 +543,7 @@ APP_EXECS=()
 APP_NAMES=()
 for app in ${APP_PATHS[@]+"${APP_PATHS[@]}"}; do
   [ -d "$app" ] || die "App bundle not found: $app"
-  meta="$(/usr/bin/python3 -c 'import plistlib,sys
+  meta="$("$PY" -c 'import plistlib,sys
 with open(sys.argv[1],"rb") as f: d=plistlib.load(f)
 print(d.get("CFBundleExecutable",""))' "$app/Contents/Info.plist" 2>/dev/null || true)"
   [ -n "$meta" ] || die "CFBundleExecutable missing in $app/Contents/Info.plist"
@@ -539,7 +558,7 @@ done
 # inside a tunnelled app terminates the session running the test.
 GUARD_FILE="$STATE_DIR/protected.json"
 if [ -f "$GUARD_FILE" ]; then
-  PROTECTED_BUNDLE="$(/usr/bin/python3 -c '
+  PROTECTED_BUNDLE="$("$PY" -c '
 import json,sys
 try: print(json.load(open(sys.argv[1])).get("host_bundle") or "")
 except Exception: pass' "$GUARD_FILE" 2>/dev/null)"
@@ -611,7 +630,7 @@ fi
 # Probe the advertised endpoint, then a couple of common fallbacks, so a stale
 # or missing system setting is not fatal on its own.
 socks_open() {
-  /usr/bin/python3 -c '
+  "$PY" -c '
 import socket, sys
 s = socket.socket(); s.settimeout(2)
 try: s.connect((sys.argv[1], int(sys.argv[2]))); sys.exit(0)
@@ -800,9 +819,10 @@ class Server(socketserver.ThreadingTCPServer):
 ap = argparse.ArgumentParser()
 ap.add_argument("--socks-host", default="127.0.0.1")
 ap.add_argument("--socks-port", type=int, default=1080)
+ap.add_argument("--port", type=int, default=0)
 ap.add_argument("--port-file", required=True)
 args = ap.parse_args()
-with Server(("127.0.0.1", 0), Handler) as srv:
+with Server(("127.0.0.1", args.port), Handler) as srv:
     srv.socks_host = args.socks_host
     srv.socks_port = args.socks_port
     with open(args.port_file, "w") as f:
@@ -811,8 +831,8 @@ with Server(("127.0.0.1", 0), Handler) as srv:
 PYBRIDGE
 chmod 700 "$BRIDGE_SCRIPT"
 
-/usr/bin/python3 "$BRIDGE_SCRIPT" --socks-host "$SOCKS_HOST" --socks-port "$SOCKS_PORT" \
-  --port-file "$BRIDGE_PORT_FILE" >"$BRIDGE_LOG" 2>&1 &
+"$PY" "$BRIDGE_SCRIPT" --socks-host "$SOCKS_HOST" --socks-port "$SOCKS_PORT" \
+  --port "$BRIDGE_PORT" --port-file "$BRIDGE_PORT_FILE" >"$BRIDGE_LOG" 2>&1 &
 BRIDGE_PID=$!
 
 i=0
@@ -848,14 +868,21 @@ retire_orphaned_state
 # --------------------------------------------------------------- phase 5 ---
 phase 5 GROUP "creating temporary isolation group"
 
-GROUP_GID=$((57000 + ($$ % 500)))
-while /usr/bin/dscl . -search /Groups PrimaryGroupID "$GROUP_GID" 2>/dev/null | grep -q .; do
-  GROUP_GID=$((GROUP_GID + 1))
-  [ "$GROUP_GID" -lt 58000 ] || die "No free temporary group id (run tunnel-doctor.sh --fix)."
-done
-
-sudo /usr/sbin/dseditgroup -o create -i "$GROUP_GID" "$GROUP_NAME" >/dev/null
-GROUP_CREATED=1
+# Reuse the group if it is already there: its members are the apps that survived
+# the last disconnect, and they are only still reachable because their gid has
+# not changed. Never silently pick a different gid - an app cannot follow one.
+GROUP_GID=57000
+existing_gid="$(/usr/bin/dscl . -read "/Groups/$GROUP_NAME" PrimaryGroupID 2>/dev/null | awk '{print $2}')"
+if [ -n "$existing_gid" ]; then
+  GROUP_GID="$existing_gid"
+  log "      reusing isolation group $GROUP_NAME (gid=$GROUP_GID)"
+else
+  if /usr/bin/dscl . -search /Groups PrimaryGroupID "$GROUP_GID" 2>/dev/null | grep -q .; then
+    die "gid $GROUP_GID is held by another group, so the isolation group cannot be created. Free it, or run tunnel-doctor.sh --fix."
+  fi
+  sudo /usr/sbin/dseditgroup -o create -i "$GROUP_GID" "$GROUP_NAME" >/dev/null
+  GROUP_CREATED=1
+fi
 sudo /usr/sbin/dseditgroup -o edit -a "$LOGIN_USER" -t user "$GROUP_NAME" >/dev/null
 probe_gid="$(sudo -n -u "$LOGIN_USER" -g "$GROUP_NAME" /usr/bin/id -g 2>/dev/null || true)"
 [ "$probe_gid" = "$GROUP_GID" ] || die "Could not establish effective-group isolation."
@@ -966,7 +993,7 @@ chmod 644 "$PROBE"
 # --------------------------------------------------------------- phase 7 ---
 phase 7 CALIBRATE "proving the leak test can actually detect egress"
 
-control="$(/usr/bin/python3 "$PROBE" 2>/dev/null || echo 0)"
+control="$("$PY" "$PROBE" 2>/dev/null || echo 0)"
 if [ "${control:-0}" -eq 0 ]; then
   die "Calibration failed: even an UNGUARDED process cannot reach any test target, so a 'blocked' result would be meaningless. Check your Internet connection and rerun. (This is the false-PASS bug from the old script.)"
 fi
@@ -977,7 +1004,7 @@ phase 8 LEAKTEST "confirming the guarded group has no direct egress"
 
 leaked="$(restricted /usr/bin/env HTTP_PROXY= HTTPS_PROXY= ALL_PROXY= NO_PROXY='*' \
   http_proxy= https_proxy= all_proxy= no_proxy='*' \
-  /usr/bin/python3 "$PROBE" 2>/dev/null || echo 0)"
+  "$PY" "$PROBE" 2>/dev/null || echo 0)"
 [ "${leaked:-0}" -eq 0 ] \
   || die "UNSAFE: guarded process reached $leaked/5 targets directly. PF is not enforcing; refusing to claim protection."
 phase_ok "0/5 targets reachable directly - guard is enforcing"
@@ -1028,7 +1055,7 @@ fi
 
 if wants_app Claude; then
   mkdir -p "$HOME/.claude"
-  /usr/bin/python3 - "$SETTINGS_FILE" "$SETTINGS_STATE" "$HTTP_PROXY_URL" <<'PY' || die "Could not patch settings.json"
+  "$PY" - "$SETTINGS_FILE" "$SETTINGS_STATE" "$HTTP_PROXY_URL" <<'PY' || die "Could not patch settings.json"
 import json, os, sys, tempfile
 settings_path, state_path, proxy = sys.argv[1:4]
 keys = {"HTTP_PROXY": proxy, "HTTPS_PROXY": proxy, "http_proxy": proxy, "https_proxy": proxy,
@@ -1062,7 +1089,7 @@ fi
 
 if wants_app ChatGPT || wants_app Codex; then
   mkdir -p "$HOME/.codex"
-  /usr/bin/python3 - "$CODEX_ENV_FILE" "$CODEX_ENV_STATE" "$HTTP_PROXY_URL" <<'PY' || die "Could not patch ~/.codex/.env"
+  "$PY" - "$CODEX_ENV_FILE" "$CODEX_ENV_STATE" "$HTTP_PROXY_URL" <<'PY' || die "Could not patch ~/.codex/.env"
 import json, os, re, sys, tempfile
 env_path, state_path, proxy = sys.argv[1:4]
 values = {"HTTP_PROXY": proxy, "HTTPS_PROXY": proxy, "http_proxy": proxy, "https_proxy": proxy,
@@ -1099,10 +1126,24 @@ PY
 fi
 phase_ok "tunnel path verified at $PROTECTED_IP"
 
+# PIDs of live processes that are already inside the isolation group AND are
+# running this executable. These are the apps that survived a disconnect: their
+# gid still matches and their baked-in HTTP_PROXY still points at the bridge
+# port, so the rebuilt tunnel is the one they were already using.
+#
+# Main-executable matches only, for the same reason main_pids_of does it: a bare
+# `grep -F "$exe"` matches the grep process itself, which made every check
+# report the app as running forever.
+group_pids_for_exe() {
+  ps -axo pid=,gid=,command= | awk -v g="$1" -v e="$2" '
+    {p=$1; gg=$2; $1=""; $2=""; sub(/^[ \t]+/,"");
+     if (gg==g && ($0==e || index($0, e " ")==1)) print p}'
+}
+
 # -------------------------------------------------------------- phase 10 ---
 phase 10 LAUNCH "starting protected app(s)"
 
-/usr/bin/python3 -c 'import json,sys
+"$PY" -c 'import json,sys
 json.dump({"pid":int(sys.argv[1]),"gid":int(sys.argv[2]),"group":sys.argv[3],
            "anchor":sys.argv[4],"proxy":sys.argv[5],"exit_ip":sys.argv[6],
            "apps":sys.argv[7:]}, open("'"$STATE_FILE"'","w"))' \
@@ -1110,9 +1151,24 @@ json.dump({"pid":int(sys.argv[1]),"gid":int(sys.argv[2]),"group":sys.argv[3],
   ${APP_PATHS[@]+"${APP_PATHS[@]}"} 2>/dev/null || true
 if (( RUN_AS_ROOT )); then chown "$LOGIN_USER" "$STATE_FILE" 2>/dev/null || true; fi
 
+# Executables adopted rather than launched. Recorded because a freshly launched
+# app is also in the group moments later, so "is it in the group?" cannot by
+# itself tell the two apart in the verification pass below.
+ADOPTED_LIST=""
+
 idx=0
 for exe in ${APP_EXECS[@]+"${APP_EXECS[@]}"}; do
   name="${APP_NAMES[$idx]}"
+  # Survived the last disconnect: adopt it rather than quitting and relaunching.
+  adopted="$(group_pids_for_exe "$GROUP_GID" "$exe" | head -1)"
+  if [ -n "$adopted" ]; then
+    log "      $name already inside the tunnel; adopting pid $adopted"
+    APP_MAIN_PIDS+=("$adopted")
+    ADOPTED_LIST="$ADOPTED_LIST$exe
+"
+    idx=$((idx+1))
+    continue
+  fi
   set +e
   launch_app /usr/bin/env \
     HOME="$LOGIN_HOME" USER="$LOGIN_USER" LOGNAME="$LOGIN_USER" PATH="$ORIGINAL_PATH" \
@@ -1131,6 +1187,12 @@ sleep 5
 idx=0
 for exe in ${APP_EXECS[@]+"${APP_EXECS[@]}"}; do
   name="${APP_NAMES[$idx]}"
+  # Adopted apps were verified in-group when they were found and were never
+  # launched, so they have no stderr log to quote and must not be recorded twice.
+  if printf '%s' "$ADOPTED_LIST" | grep -Fxq "$exe"; then
+    idx=$((idx+1))
+    continue
+  fi
   pid="$(ps -axo pid=,command= | awk -v exe="$exe" '{p=$1;$1="";sub(/^[ \t]+/,"");if($0==exe||index($0,exe" ")==1)print p}' | head -1)"
   if [ -z "$pid" ]; then
     tail -40 "$TMPROOT/$name.stderr.log" >&2 || true
@@ -1201,7 +1263,7 @@ join_app() {
   local bundle="$1" exe name pid gid i left
   [ -d "$bundle" ] || { emit 13 JOIN fail "not an app bundle: $bundle"; return 1; }
   name="$(basename "$bundle" .app)"
-  exe="$bundle/Contents/MacOS/$(/usr/bin/python3 -c '
+  exe="$bundle/Contents/MacOS/$("$PY" -c '
 import plistlib,sys
 with open(sys.argv[1],"rb") as f: print(plistlib.load(f).get("CFBundleExecutable",""))
 ' "$bundle/Contents/Info.plist" 2>/dev/null)"
@@ -1209,6 +1271,16 @@ with open(sys.argv[1],"rb") as f: print(plistlib.load(f).get("CFBundleExecutable
 
   emit 13 JOIN run "adding $name to the running tunnel"
   log "Join request: $name"
+
+  # Already a member - it survived a disconnect, or was launched with the tunnel.
+  # Adopt it. Quitting here would destroy a live session to achieve nothing.
+  adopted="$(group_pids_for_exe "$GROUP_GID" "$exe" | head -1)"
+  if [ -n "$adopted" ]; then
+    APP_MAIN_PIDS+=("$adopted")
+    log "      $name already inside the tunnel; adopting pid $adopted"
+    emit 13 JOIN ok "$name already inside the tunnel; adopted pid $adopted"
+    return 0
+  fi
 
   # Quit only this app - and only if it is actually running.
   left="$(main_pids_of "$exe")"
@@ -1290,6 +1362,34 @@ with open(sys.argv[1],"rb") as f: print(plistlib.load(f).get("CFBundleExecutable
 while any_alive; do
   sleep 3
 
+  # Publish telemetry on a slow cadence. Detached and lock-guarded: a sampling
+  # pass takes about half a second, and this loop must keep auditing the process
+  # tree every 3s regardless. A stale lock older than 2 minutes is ignored so a
+  # killed sampler cannot silence telemetry for the rest of the session.
+  TELEMETRY_TICK=$(( ${TELEMETRY_TICK:-0} + 1 ))
+  if [ $(( TELEMETRY_TICK % 5 )) -eq 0 ]; then
+    if [ -f "$TELEMETRY_LOCK" ] \
+       && [ -n "$(find "$TELEMETRY_LOCK" -mmin +2 2>/dev/null)" ]; then
+      rm -f "$TELEMETRY_LOCK"
+    fi
+    if [ ! -f "$TELEMETRY_LOCK" ]; then
+      (
+        : > "$TELEMETRY_LOCK"
+        snap="$("$(dirname "$0")/tunnel-telemetry.sh" \
+                  --gid "$GROUP_GID" --anchor "$ANCHOR" \
+                  --bridge "$HTTP_PROXY_URL" --exit-ip "$SOCKS_IP" 2>/dev/null)"
+        if [ -n "$snap" ]; then
+          printf '%s\n' "$snap" > "$TELEMETRY_FILE.tmp" \
+            && mv -f "$TELEMETRY_FILE.tmp" "$TELEMETRY_FILE"
+          if (( RUN_AS_ROOT )); then
+            chown "$LOGIN_USER" "$TELEMETRY_FILE" 2>/dev/null || true
+          fi
+        fi
+        rm -f "$TELEMETRY_LOCK"
+      ) >/dev/null 2>&1 &
+    fi
+  fi
+
   # A one-app join request from the roster's RUN button.
   if [ -f "$RUN_FILE" ]; then
     requested="$(head -1 "$RUN_FILE" 2>/dev/null)"
@@ -1321,8 +1421,10 @@ while any_alive; do
   done
   if [ "$bad" -gt 0 ]; then
     emit 12 ESCAPE fail "$bad process(es) left the isolation group - failing closed"
-    log "Failing closed: stopping protected app(s)."
-    for p in ${APP_WRAPPER_PIDS[@]+"${APP_WRAPPER_PIDS[@]}"}; do kill -TERM "$p" 2>/dev/null || true; done
+    # Exiting runs cleanup, which tears down PF and the bridge. That is what
+    # failing closed means here: the escaped process loses its route out. The
+    # apps are left running so the session survives and can re-adopt the tunnel.
+    log "Failing closed: dropping the network, apps left running."
     exit 70
   fi
 done

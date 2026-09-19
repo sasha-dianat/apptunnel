@@ -206,6 +206,7 @@ canvas#viz{display:block;width:176px;height:44px;image-rendering:pixelated}
           <span class="btn stop" id="bStop" title="Disconnect and restore">■</span>
           <span class="btn" id="bNext" title="Repair leftovers">►►</span>
           <span class="btn wide" id="bAdd" title="Add an app to the tunnel">⏏ ADD</span>
+          <span class="btn wide" id="bFix" title="Bring the VeePN SOCKS endpoint up (VeePN.app says connected without running its core)">✚ VPN</span>
         </div>
       </div>
       <div class="mright">
@@ -573,6 +574,14 @@ $("bPrev").onclick = () => api("doctor", {method:"POST", headers:{"Content-Type"
 $("bNext").onclick = () => {
   if(confirm("Repair leftovers?\n\nThis removes orphaned isolation groups, dead bridges,\nstale PF anchors and dead proxy entries.\n\nIt does NOT touch DHCP, DNS or any network service."))
     api("doctor", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({fix:true})});
+};
+// Supplies the SOCKS endpoint that Run requires. Safe while a session is live:
+// it starts VeePN's own core and repoints the system proxy, and never signals
+// the launcher or the apps inside it.
+$("bFix").onclick = () => {
+  setMarquee("bringing the VeePN tunnel up…");
+  api("repair", {method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({status:false})});
 };
 $("bDemo").onclick = runDemo;
 $("bReplay").onclick = runDemo;

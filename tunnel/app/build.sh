@@ -4,23 +4,115 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-SRC="$HERE/AppTunnel/Sources/main.swift"
+ROOT="$(dirname "$(dirname "$HERE")")"        # the "Claude-Chatgpt Tunnel" folder
+SRC_DIR="$HERE/AppTunnel/Sources"
 APP="$HERE/AppTunnel.app"
 MACOS="$APP/Contents/MacOS"
 RES="$APP/Contents/Resources"
+INSTALLED="$ROOT/AppTunnel.app"               # the one README tells you to double-click
 
-command -v swiftc >/dev/null || { echo "swiftc not found. Install the Xcode Command Line Tools."; exit 1; }
+# The icon generator needs a python3 that runs; /usr/bin/python3 is a stub that
+# only works when a developer directory is active.
+. "$(dirname "$HERE")/bin/tunnel-python.sh"
+
+# ---- find a toolchain that actually works ----------------------------------
+#
+# /usr/bin/swiftc always exists on macOS - it is a stub that forwards to the
+# active developer directory. When that directory is empty (the Command Line
+# Tools are not part of a stock install, and an OS upgrade can gut them) the
+# stub is still there and still executable, but every invocation dies with
+# "invalid active developer path". Testing for the command is therefore
+# useless; the only honest test is to run it.
+#
+# DEVELOPER_DIR overrides xcode-select for the current process only, so a copy
+# of Xcode that was downloaded but never "installed" - sitting in ~/Downloads,
+# say - can be used without sudo and without changing a single system setting.
+# That matters here: this project exists because a previous tool rearranged the
+# machine's configuration.
+echo "==> toolchain"
+find_developer_dir() {
+  local c
+  for c in "${DEVELOPER_DIR:-}" \
+           "$(xcode-select -p 2>/dev/null || true)" \
+           /Applications/Xcode.app/Contents/Developer \
+           "$HOME/Downloads/Xcode.app/Contents/Developer" \
+           "$HOME/Applications/Xcode.app/Contents/Developer" \
+           /Library/Developer/CommandLineTools; do
+    [ -n "$c" ] && [ -d "$c" ] || continue
+    if DEVELOPER_DIR="$c" swiftc --version >/dev/null 2>&1; then
+      printf '%s\n' "$c"; return 0
+    fi
+  done
+  # Last resort: ask Spotlight where Xcode is.
+  while IFS= read -r app; do
+    [ -n "$app" ] || continue
+    c="$app/Contents/Developer"
+    if [ -d "$c" ] && DEVELOPER_DIR="$c" swiftc --version >/dev/null 2>&1; then
+      printf '%s\n' "$c"; return 0
+    fi
+  done <<EOF
+$(mdfind "kMDItemCFBundleIdentifier == 'com.apple.dt.Xcode'" 2>/dev/null)
+EOF
+  return 1
+}
+
+if DEV="$(find_developer_dir)"; then
+  export DEVELOPER_DIR="$DEV"
+  echo "    $DEV"
+  echo "    $(swiftc --version 2>/dev/null | head -1)"
+else
+  echo "No working Swift toolchain found."
+  echo
+  echo "/usr/bin/swiftc is a stub and the active developer directory is empty:"
+  swiftc --version 2>&1 | sed 's/^/    /' || true
+  echo
+  echo "Install the Command Line Tools:"
+  echo "    xcode-select --install"
+  echo "or set DEVELOPER_DIR to an Xcode you already have, e.g."
+  echo "    DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer $0"
+  exit 1
+fi
 
 echo "==> cleaning"
 rm -rf "$APP"
 mkdir -p "$MACOS" "$RES"
 
 echo "==> compiling"
-swiftc -O \
-  -target x86_64-apple-macosx11.0 \
-  -framework AppKit \
-  -o "$MACOS/AppTunnel" \
-  "$SRC"
+# Compile every file in Sources/ so the app can be split into focused units.
+# An array, not $(ls ...): this project lives under a path containing a space
+# ("Claude-Chatgpt Tunnel"), and unquoted command substitution word-splits it.
+SRCS=("$SRC_DIR"/*.swift)
+[ -e "${SRCS[0]}" ] || { echo "no Swift sources in $SRC_DIR"; exit 1; }
+
+# Build both architectures and lipo them together. The previous version pinned
+# -target x86_64 only, which produced a binary that needs Rosetta on any Apple
+# Silicon Mac - and Rosetta is not installed by default, so the app would refuse
+# to open at all there. A slice that will not build (no SDK support for that
+# arch on this host) is skipped rather than failing the build.
+TMPD="$(mktemp -d)"
+trap 'rm -rf "$TMPD"' EXIT
+SLICES=()
+for arch in arm64 x86_64; do
+  if swiftc -O \
+       -target "$arch-apple-macosx11.0" \
+       -framework AppKit \
+       -o "$TMPD/AppTunnel.$arch" \
+       "${SRCS[@]}" 2>"$TMPD/err.$arch"; then
+    SLICES+=("$TMPD/AppTunnel.$arch")
+    echo "    $arch ok"
+  else
+    echo "    $arch skipped"
+    sed 's/^/      /' "$TMPD/err.$arch" | head -4
+  fi
+done
+[ "${#SLICES[@]}" -gt 0 ] || { echo "no architecture compiled - see the errors above"; exit 1; }
+if [ "${#SLICES[@]}" -gt 1 ]; then
+  lipo -create -output "$MACOS/AppTunnel" "${SLICES[@]}"
+else
+  cp "${SLICES[0]}" "$MACOS/AppTunnel"
+fi
+chmod +x "$MACOS/AppTunnel"
+echo "    $(lipo -archs "$MACOS/AppTunnel" 2>/dev/null || echo unknown)"
 
 echo "==> bundle metadata"
 cat > "$APP/Contents/Info.plist" <<'PLIST'
@@ -49,7 +141,7 @@ plutil -lint "$APP/Contents/Info.plist" >/dev/null
 echo "==> icon"
 ICONSET="$(mktemp -d)/AppTunnel.iconset"
 mkdir -p "$ICONSET"
-/usr/bin/python3 - "$ICONSET" <<'PY'
+"$PY" - "$ICONSET" <<'PY'
 import os, struct, sys, zlib
 out = sys.argv[1]
 
@@ -87,9 +179,33 @@ iconutil -c icns "$ICONSET" -o "$RES/AppTunnel.icns" 2>/dev/null \
   && echo "    icon built" || echo "    icon skipped (non-fatal)"
 
 echo "==> signing (ad-hoc)"
-codesign --force --deep --sign - "$APP" 2>/dev/null && echo "    signed" || echo "    unsigned (non-fatal)"
+# --deep is deprecated as of Sonoma and warns on every run. There is nothing
+# nested to sign here - one executable, one icon - so signing the bundle is
+# enough. Any stale quarantine flag is cleared too, or Gatekeeper shows the
+# "damaged" dialog instead of opening the app.
+xattr -dr com.apple.quarantine "$APP" 2>/dev/null || true
+codesign --force --sign - "$APP" 2>/dev/null && echo "    signed" || echo "    unsigned (non-fatal)"
 
 touch "$APP"
+
+echo "==> installing"
+# The bundle the user actually opens lives at the project root - tunnel/README.md
+# says "double-click AppTunnel.app" and tunnel-migrate.sh looks for it there -
+# but the build only ever produced one inside tunnel/app/. Nothing copied it
+# across, so the two drifted apart by weeks: every fix landed in a bundle nobody
+# opened, while the root copy stayed frozen at whatever was built the day it was
+# first created. That is why the app "did not function" after being fixed.
+if [ "$INSTALLED" = "$APP" ]; then
+  echo "    already at the project root"
+else
+  rm -rf "$INSTALLED"
+  # ditto, not cp -R: it preserves the code signature and resource forks.
+  ditto "$APP" "$INSTALLED"
+  touch "$INSTALLED"
+  echo "    $INSTALLED"
+fi
+
 echo
-echo "Built: $APP"
-echo "Open with:  open \"$APP\""
+echo "Built:     $APP"
+echo "Installed: $INSTALLED"
+echo "Open with:  open \"$INSTALLED\""
