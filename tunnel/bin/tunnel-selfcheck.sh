@@ -325,6 +325,20 @@ else
   pass "throughput changes do not repaint the whole window"
 fi
 # VeePN.app cannot stop the core this app starts, so the app must offer the lever.
+# The bridge is a background child of the launcher. A -KILL on the launcher
+# skips its cleanup trap, so the bridge reparents to launchd and holds the FIXED
+# port forever - every later connect then died at phase 3 while ps showed no
+# launcher at all. It is root-owned, so only the root connect path can clear it.
+grep -q 'http_to_socks' "$BIN/tunnel-connect.sh" 2>/dev/null \
+  && pass "connect retires orphaned bridges before binding the fixed port" \
+  || fail "connect retires orphaned bridges before binding the fixed port"
+# Connect runs detached; a second press raced the first and scrambled the phases.
+if awk '/func connect\(\)/,/^    }/' "$SRC" 2>/dev/null | grep -q 'if m.connecting {'; then
+  pass "a second press while connecting is refused, not raced"
+else
+  fail "a second press while connecting is refused, not raced"
+fi
+
 grep -q 'func toggleVPN' "$SRC" 2>/dev/null \
   && pass "the VPN control can stop the tunnel, not only start it" \
   || fail "the VPN control can stop the tunnel, not only start it"

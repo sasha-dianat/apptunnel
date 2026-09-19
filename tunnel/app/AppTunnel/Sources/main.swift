@@ -1059,6 +1059,14 @@ final class Main: NSWindow {
     func connect() {
         let m = Model.shared
         if m.sessionActive { warn("A tunnel is already running.", "Press the stop button first."); return }
+        // A connect runs detached, so the button stays live while it works.
+        // Pressing it again started a SECOND tunnel-connect.sh: the two raced,
+        // each truncating and rewriting events.jsonl, and the phase display
+        // showed whichever won - phases appearing, vanishing and repeating.
+        if m.connecting {
+            warn("Already connecting.", "Wait for the current attempt to finish or fail.")
+            return
+        }
         var apps = m.enabledApps
         guard !apps.isEmpty else { warn("Nothing to launch.", "Tick at least one app in the roster."); return }
 

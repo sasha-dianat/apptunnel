@@ -166,6 +166,26 @@ if [ -n "$left" ]; then
 fi
 stamp "legacy sessions retired"
 
+# Retire orphaned bridges.
+#
+# The bridge is a background child of the launcher. Killing the launcher with
+# -KILL skips its cleanup trap, so the bridge is never signalled: it reparents
+# to launchd and keeps holding the FIXED port forever. Every later connect then
+# died at phase 3 with "Address already in use" while `ps` showed no launcher at
+# all, which made it look like the port was held by nothing.
+#
+# Matched on the bridge script's own name, so this can only ever hit ours.
+bridge_pids="$(find_pids 'http_to_socks\.py' | drop_protected | only_pids)"
+if [ -n "$bridge_pids" ]; then
+  stamp "retiring orphaned bridge(s): $(echo "$bridge_pids" | tr '\n' ' ')"
+  # shellcheck disable=SC2086
+  kill -TERM $bridge_pids 2>/dev/null
+  sleep 1
+  bridge_pids="$(find_pids 'http_to_socks\.py' | drop_protected | only_pids)"
+  # shellcheck disable=SC2086
+  [ -n "$bridge_pids" ] && kill -KILL $bridge_pids 2>/dev/null
+fi
+
 # The retired launcher's bridge socket can outlive the process by a moment. The
 # replacement binds a FIXED port, so handing off before the old socket is gone
 # fails at phase 3 with "Address already in use" - the one error this ordering
