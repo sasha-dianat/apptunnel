@@ -872,7 +872,10 @@ phase 5 GROUP "creating temporary isolation group"
 # the last disconnect, and they are only still reachable because their gid has
 # not changed. Never silently pick a different gid - an app cannot follow one.
 GROUP_GID=57000
-existing_gid="$(/usr/bin/dscl . -read "/Groups/$GROUP_NAME" PrimaryGroupID 2>/dev/null | awk '{print $2}')"
+# `|| true` is load-bearing: dscl exits 56 when the group does not exist, and
+# this script runs with `set -euo pipefail`, so an unguarded substitution here
+# killed the launcher at phase 5 with no message at all.
+existing_gid="$(/usr/bin/dscl . -read "/Groups/$GROUP_NAME" PrimaryGroupID 2>/dev/null | awk '{print $2}' || true)"
 if [ -n "$existing_gid" ]; then
   GROUP_GID="$existing_gid"
   log "      reusing isolation group $GROUP_NAME (gid=$GROUP_GID)"
@@ -1160,7 +1163,9 @@ idx=0
 for exe in ${APP_EXECS[@]+"${APP_EXECS[@]}"}; do
   name="${APP_NAMES[$idx]}"
   # Survived the last disconnect: adopt it rather than quitting and relaunching.
-  adopted="$(group_pids_for_exe "$GROUP_GID" "$exe" | head -1)"
+  # `|| true`: head closes the pipe after one line, so a second match makes awk
+  # die of SIGPIPE and pipefail would carry 141 into this assignment.
+  adopted="$(group_pids_for_exe "$GROUP_GID" "$exe" | head -1 || true)"
   if [ -n "$adopted" ]; then
     log "      $name already inside the tunnel; adopting pid $adopted"
     APP_MAIN_PIDS+=("$adopted")
@@ -1193,7 +1198,7 @@ for exe in ${APP_EXECS[@]+"${APP_EXECS[@]}"}; do
     idx=$((idx+1))
     continue
   fi
-  pid="$(ps -axo pid=,command= | awk -v exe="$exe" '{p=$1;$1="";sub(/^[ \t]+/,"");if($0==exe||index($0,exe" ")==1)print p}' | head -1)"
+  pid="$(ps -axo pid=,command= | awk -v exe="$exe" '{p=$1;$1="";sub(/^[ \t]+/,"");if($0==exe||index($0,exe" ")==1)print p}' | head -1 || true)"
   if [ -z "$pid" ]; then
     tail -40 "$TMPROOT/$name.stderr.log" >&2 || true
     die "$name did not start inside the tunnel."
@@ -1274,7 +1279,9 @@ with open(sys.argv[1],"rb") as f: print(plistlib.load(f).get("CFBundleExecutable
 
   # Already a member - it survived a disconnect, or was launched with the tunnel.
   # Adopt it. Quitting here would destroy a live session to achieve nothing.
-  adopted="$(group_pids_for_exe "$GROUP_GID" "$exe" | head -1)"
+  # `|| true`: head closes the pipe after one line, so a second match makes awk
+  # die of SIGPIPE and pipefail would carry 141 into this assignment.
+  adopted="$(group_pids_for_exe "$GROUP_GID" "$exe" | head -1 || true)"
   if [ -n "$adopted" ]; then
     APP_MAIN_PIDS+=("$adopted")
     log "      $name already inside the tunnel; adopting pid $adopted"
@@ -1341,7 +1348,7 @@ with open(sys.argv[1],"rb") as f: print(plistlib.load(f).get("CFBundleExecutable
   i=0; pid=""
   while [ "$i" -lt 20 ]; do
     sleep 0.5
-    pid="$(ps -axo pid=,command= | awk -v e="$exe" '{p=$1;$1="";sub(/^[ \t]+/,"");if($0==e||index($0,e" ")==1)print p}' | head -1)"
+    pid="$(ps -axo pid=,command= | awk -v e="$exe" '{p=$1;$1="";sub(/^[ \t]+/,"");if($0==e||index($0,e" ")==1)print p}' | head -1 || true)"
     [ -n "$pid" ] && break
     i=$((i+1))
   done

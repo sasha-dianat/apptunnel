@@ -214,6 +214,30 @@ grep -q 'tunnel-quit.sh' "$BIN/../gui/tunneld.py" \
   && pass "the GUI closes tunnelled apps when it shuts down" \
   || fail "the GUI closes tunnelled apps when it shuts down"
 
+# tunnel-lock.sh runs `set -euo pipefail`, which turns a command substitution
+# that ends non-zero into a SILENT script death - no die(), no message, just
+# teardown. Phase 5 died this way: `dscl -read` exits 56 when the group does not
+# exist, and pipefail carried that out of the pipeline into the assignment.
+# A pipeline ending in `head -1` is the same hazard via SIGPIPE (141) as soon as
+# there is more than one match.
+if grep -qE 'existing_gid="\$\(.*\|\| true\)"' "$BIN/tunnel-lock.sh"; then
+  pass "the isolation-group lookup survives a missing group"
+else
+  fail "the isolation-group lookup survives a missing group"
+fi
+if grep -qE 'adopted="\$\(group_pids_for_exe[^)]*\| head -1\)"' "$BIN/tunnel-lock.sh"; then
+  fail "adoption lookups survive SIGPIPE under pipefail"
+else
+  pass "adoption lookups survive SIGPIPE under pipefail"
+fi
+# Prove the idiom itself, not just its spelling: guarded, it must still yield the
+# first line instead of killing the shell.
+if bash -c 'set -euo pipefail; f() { printf "a\nb\nc\n"; }; x="$(f | head -1 || true)"; [ "$x" = a ]' 2>/dev/null; then
+  pass "the guarded head -1 idiom returns the first match without dying"
+else
+  fail "the guarded head -1 idiom returns the first match without dying"
+fi
+
 # SUDO_USER can be inherited as "root" through a sudo chain, which made the
 # doctor abort after one line and show an almost-empty window.
 for f in tunnel-doctor.sh tunnel-freehost.sh tunnel-testkit.sh; do
