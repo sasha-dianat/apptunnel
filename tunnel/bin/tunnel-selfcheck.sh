@@ -187,6 +187,20 @@ else
   fail "escape handler cuts the network without killing apps"
 fi
 
+# Whole-file audit, not a per-path one. cleanup() and the escape handler were
+# fixed individually and the STOP_FILE handler was missed, so pressing stop
+# still killed every tunnelled app - the exact behaviour that was supposed to
+# be gone. Only tunnel-quit.sh may close these apps. `kill -0` is a liveness
+# test, not a signal, so any_alive is allowed.
+kill_sites="$(grep -nE 'APP_(WRAPPER|MAIN)_PIDS' "$BIN/tunnel-lock.sh" \
+              | grep -E 'kill +-(TERM|KILL|HUP|INT|QUIT|1|2|3|9|15)' || true)"
+if [ -z "$kill_sites" ]; then
+  pass "no path in tunnel-lock.sh signals the tunnelled apps"
+else
+  fail "no path in tunnel-lock.sh signals the tunnelled apps"
+  printf '%s\n' "$kill_sites" | sed 's/^/          /'
+fi
+
 # A reconnect must adopt the processes that are already inside the group
 # instead of quitting and relaunching them.
 grep -q '^group_pids_for_exe()' "$BIN/tunnel-lock.sh" \

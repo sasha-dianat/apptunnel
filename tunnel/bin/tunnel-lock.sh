@@ -1406,10 +1406,14 @@ while any_alive; do
   # The app requests shutdown by creating this file; it cannot signal a
   # root-owned launcher directly.
   if [ -f "$STOP_FILE" ]; then
-    log "Stop requested from AppTunnel; shutting the tunnel down."
+    log "Stop requested from AppTunnel; dropping the network, apps left running."
     emit 97 STOPPING run "stop requested"
-    for p in ${APP_WRAPPER_PIDS[@]+"${APP_WRAPPER_PIDS[@]}"}; do kill -TERM "$p" 2>/dev/null || true; done
-    for p in ${APP_MAIN_PIDS[@]+"${APP_MAIN_PIDS[@]}"}; do kill -TERM "$p" 2>/dev/null || true; done
+    # Stop tears the tunnel down; it does not close the apps. They keep running
+    # with no route out, hold their gid, and are adopted again by the next
+    # connect - which is the whole point of pressing stop and then play. Killing
+    # them here destroyed live Claude and Codex sessions on every stop, and was
+    # missed when cleanup() and the escape handler were fixed one path at a
+    # time. tunnel-quit.sh is the only path that may close them.
     break
   fi
   bad=0
@@ -1436,5 +1440,11 @@ while any_alive; do
   fi
 done
 
-log "All protected apps exited."
+# Reached either because every protected app exited on its own, or because stop
+# was requested - in which case they are still running, just without a route.
+if any_alive; then
+  log "Tunnel down. Protected app(s) left running; press play to reconnect them."
+else
+  log "All protected apps exited."
+fi
 exit 0
