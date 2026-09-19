@@ -54,10 +54,13 @@ SOCKS_HOST="127.0.0.1"
 SOCKS_PORT="1080"
 SOCKS_HOST_SET=0
 SOCKS_PORT_SET=0
-# Per-session anchor. A single shared anchor name meant a second run's teardown
-# flushed the FIRST run's rules, silently disarming a live session's firewall.
-# tunnel-doctor globs apptunnel-* so orphans stay discoverable.
-ANCHOR="com.apple/apptunnel-$$"
+# Fixed anchor. A surviving app must still be covered when the tunnel is rebuilt
+# after a disconnect, so the anchor cannot be per-session. The original reason
+# for keying it to $$ was that a second run's teardown flushed the first run's
+# rules; that is now prevented by STATE_FILE enforcing a single launcher, which
+# is what makes one shared anchor safe. tunnel-doctor globs apptunnel* so
+# orphans stay discoverable.
+ANCHOR="com.apple/apptunnel"
 STATE_DIR="$HOME/.apptunnel"
 EVENT_LOG="$STATE_DIR/events.jsonl"
 STATE_FILE="$STATE_DIR/session.json"
@@ -66,7 +69,7 @@ RUN_FILE="$STATE_DIR/run-request"
 TELEMETRY_FILE="$STATE_DIR/telemetry.json"
 TELEMETRY_LOCK="$STATE_DIR/telemetry.lock"
 
-GROUP_NAME="apptun$$"
+GROUP_NAME="apptunnel"
 GROUP_GID=""
 PF_TOKEN=""
 PF_ENABLED_BY_US=0
@@ -76,7 +79,10 @@ SETTINGS_PATCHED=0
 CODEX_ENV_PATCHED=0
 SUDO_KEEPALIVE_PID=""
 BRIDGE_PID=""
-BRIDGE_PORT=""
+# Fixed: an app's HTTP_PROXY is baked into its environment at exec and cannot be
+# changed afterward, so a rebuilt bridge MUST return on the same port or every
+# surviving app is left pointing at a dead one.
+BRIDGE_PORT="${TUNNEL_BRIDGE_PORT:-17080}"
 CLEANUP_PROBLEMS=0
 STATE_OWNED=0
 LOGIN_USER_OVERRIDE=""
@@ -814,9 +820,10 @@ class Server(socketserver.ThreadingTCPServer):
 ap = argparse.ArgumentParser()
 ap.add_argument("--socks-host", default="127.0.0.1")
 ap.add_argument("--socks-port", type=int, default=1080)
+ap.add_argument("--port", type=int, default=0)
 ap.add_argument("--port-file", required=True)
 args = ap.parse_args()
-with Server(("127.0.0.1", 0), Handler) as srv:
+with Server(("127.0.0.1", args.port), Handler) as srv:
     srv.socks_host = args.socks_host
     srv.socks_port = args.socks_port
     with open(args.port_file, "w") as f:
@@ -826,7 +833,7 @@ PYBRIDGE
 chmod 700 "$BRIDGE_SCRIPT"
 
 "$PY" "$BRIDGE_SCRIPT" --socks-host "$SOCKS_HOST" --socks-port "$SOCKS_PORT" \
-  --port-file "$BRIDGE_PORT_FILE" >"$BRIDGE_LOG" 2>&1 &
+  --port "$BRIDGE_PORT" --port-file "$BRIDGE_PORT_FILE" >"$BRIDGE_LOG" 2>&1 &
 BRIDGE_PID=$!
 
 i=0
@@ -862,14 +869,21 @@ retire_orphaned_state
 # --------------------------------------------------------------- phase 5 ---
 phase 5 GROUP "creating temporary isolation group"
 
-GROUP_GID=$((57000 + ($$ % 500)))
-while /usr/bin/dscl . -search /Groups PrimaryGroupID "$GROUP_GID" 2>/dev/null | grep -q .; do
-  GROUP_GID=$((GROUP_GID + 1))
-  [ "$GROUP_GID" -lt 58000 ] || die "No free temporary group id (run tunnel-doctor.sh --fix)."
-done
-
-sudo /usr/sbin/dseditgroup -o create -i "$GROUP_GID" "$GROUP_NAME" >/dev/null
-GROUP_CREATED=1
+# Reuse the group if it is already there: its members are the apps that survived
+# the last disconnect, and they are only still reachable because their gid has
+# not changed. Never silently pick a different gid - an app cannot follow one.
+GROUP_GID=57000
+existing_gid="$(/usr/bin/dscl . -read "/Groups/$GROUP_NAME" PrimaryGroupID 2>/dev/null | awk '{print $2}')"
+if [ -n "$existing_gid" ]; then
+  GROUP_GID="$existing_gid"
+  log "      reusing isolation group $GROUP_NAME (gid=$GROUP_GID)"
+else
+  if /usr/bin/dscl . -search /Groups PrimaryGroupID "$GROUP_GID" 2>/dev/null | grep -q .; then
+    die "gid $GROUP_GID is held by another group, so the isolation group cannot be created. Free it, or run tunnel-doctor.sh --fix."
+  fi
+  sudo /usr/sbin/dseditgroup -o create -i "$GROUP_GID" "$GROUP_NAME" >/dev/null
+  GROUP_CREATED=1
+fi
 sudo /usr/sbin/dseditgroup -o edit -a "$LOGIN_USER" -t user "$GROUP_NAME" >/dev/null
 probe_gid="$(sudo -n -u "$LOGIN_USER" -g "$GROUP_NAME" /usr/bin/id -g 2>/dev/null || true)"
 [ "$probe_gid" = "$GROUP_GID" ] || die "Could not establish effective-group isolation."

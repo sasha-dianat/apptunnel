@@ -159,6 +159,20 @@ else
   fail "tunnel-connect.sh proves the SOCKS endpoint before it kills anything"
 fi
 
+# Re-attach requires identity that survives a reconnect. Keying the group, the
+# anchor or the bridge port to $$ built a tunnel the surviving app was not a
+# member of and could not reach, so reconnecting forced a relaunch.
+for pat in 'ANCHOR="com.apple/apptunnel-\$\$"' 'GROUP_NAME="apptun\$\$"' 'GROUP_GID=\$((57000 + (\$\$ % 500)))'; do
+  if grep -q "$pat" "$BIN/tunnel-lock.sh"; then
+    fail "tunnel-lock.sh does not key tunnel identity to \$\$ ($pat)"
+  else
+    pass "tunnel-lock.sh does not key tunnel identity to \$\$ ($pat)"
+  fi
+done
+grep -q 'BRIDGE_PORT="\${TUNNEL_BRIDGE_PORT:-17080}"' "$BIN/tunnel-lock.sh" \
+  && pass "tunnel-lock.sh pins the bridge to a fixed port" \
+  || fail "tunnel-lock.sh pins the bridge to a fixed port"
+
 # SUDO_USER can be inherited as "root" through a sudo chain, which made the
 # doctor abort after one line and show an almost-empty window.
 for f in tunnel-doctor.sh tunnel-freehost.sh tunnel-testkit.sh; do
