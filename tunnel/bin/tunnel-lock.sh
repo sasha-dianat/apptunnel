@@ -584,12 +584,34 @@ fi
 
 # Every selected app must be fully quit, otherwise LaunchServices may reuse a
 # process that lives outside the isolation group.
+#
+# Unless it is already INSIDE the group. Those are the apps that survived the
+# last disconnect, and they are exactly what phase 10 adopts. Quitting them here
+# made adoption unreachable - by phase 10 the group was empty, so every
+# reconnect closed Claude and Codex and relaunched them. Three teardown paths
+# were fixed for this while this one, on the connect side, kept doing it.
+#
+# The gid is read here rather than taken from GROUP_GID, which is not assigned
+# until phase 5. `|| true` because dscl exits non-zero when the group is absent
+# and this script runs under `set -euo pipefail`.
+PREFLIGHT_GID="$(/usr/bin/dscl . -read "/Groups/$GROUP_NAME" PrimaryGroupID 2>/dev/null | awk '{print $2}' || true)"
+
 idx=0
 for exe in ${APP_EXECS[@]+"${APP_EXECS[@]}"}; do
   name="${APP_NAMES[$idx]}"
+  if [ -n "${PREFLIGHT_GID:-}" ]; then
+    inside="$(ps -axo pid=,gid=,command= | awk -v g="$PREFLIGHT_GID" -v e="$exe" '
+      {p=$1; gg=$2; $1=""; $2=""; sub(/^[ \t]+/,"");
+       if (gg==g && ($0==e || index($0, e " ")==1)) print p}' || true)"
+    if [ -n "$inside" ]; then
+      log "      $name is already inside the tunnel (pid $(echo "$inside" | tr '\n' ' ')); leaving it running to be adopted"
+      idx=$((idx+1))
+      continue
+    fi
+  fi
   running="$(ps -axo pid=,command= | awk -v exe="$exe" '{p=$1;$1="";sub(/^[ \t]+/,"");if($0==exe||index($0,exe" ")==1)print p}')"
   if [ -n "$running" ]; then
-    log "      $name is running; asking it to quit"
+    log "      $name is running OUTSIDE the tunnel; asking it to quit so it can be moved in"
     /usr/bin/osascript -e "tell application \"$name\" to quit" >/dev/null 2>&1 || true
     i=0
     while [ "$i" -lt 50 ]; do

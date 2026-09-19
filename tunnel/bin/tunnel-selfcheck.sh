@@ -215,6 +215,17 @@ else
   fail "join_app skips the quit for an app already in the group"
 fi
 
+# PREFLIGHT (phase 1) quit every running roster app unconditionally, so a
+# reconnect closed Claude and Codex before the adoption logic in phase 10 could
+# ever see them - nothing was left in the group by then. Three teardown paths
+# were fixed while this one, on the CONNECT side, kept doing it.
+if awk '/^# Every selected app must be fully quit/,/^done$/' "$BIN/tunnel-lock.sh" \
+     | grep -q 'PREFLIGHT_GID'; then
+  pass "preflight leaves apps already inside the tunnel alone"
+else
+  fail "preflight leaves apps already inside the tunnel alone"
+fi
+
 # Stop leaves apps running so they can re-adopt; quitting AppTunnel is the one
 # action that closes them.
 if [ -x "$BIN/tunnel-quit.sh" ]; then
@@ -278,6 +289,23 @@ for f in tunnel-eventlog.sh tunnel-forensics.sh; do
   [ -x "$BIN/$f" ] && pass "$f exists and is executable" || fail "$f exists and is executable"
   bash -n "$BIN/$f" 2>/dev/null && pass "$f parses" || fail "$f parses"
 done
+# The UI animated at a flat 30fps forever, stepping four views and dirtying the
+# title bar every tick even while the window was hidden. Each frame also cost a
+# WindowServer composite, so an idle tunnel sat at ~18% + ~24% of a core.
+if grep -q 'withTimeInterval: 1.0 / 30, repeats: true' "$SRC" 2>/dev/null; then
+  fail "the UI does not animate at a flat 30fps regardless of state"
+else
+  pass "the UI does not animate at a flat 30fps regardless of state"
+fi
+grep -q 'didChangeOcclusionStateNotification' "$SRC" 2>/dev/null \
+  && pass "the UI stops animating when nobody can see it" \
+  || fail "the UI stops animating when nobody can see it"
+if awk '/private func pulseLED/,/^    }/' "$SRC" 2>/dev/null | grep -q 'if v != tb.ledPulse'; then
+  pass "the LED only forces a redraw when its value actually changed"
+else
+  fail "the LED only forces a redraw when its value actually changed"
+fi
+
 grep -q 'who.*AppTunnel stop button' "$SRC" 2>/dev/null \
   && pass "the stop button records who requested the stop" \
   || fail "the stop button records who requested the stop"
@@ -287,6 +315,28 @@ grep -q '"who": "AppTunnel web GUI' "$BIN/../gui/tunneld.py" 2>/dev/null \
 grep -q 'stop_who=' "$BIN/tunnel-lock.sh" \
   && pass "the launcher logs the stop provenance it was given" \
   || fail "the launcher logs the stop provenance it was given"
+# The recorder runs forever, so its per-sample cost is multiplied by every
+# interval for as long as the machine is on. At 1.24s per sample on a 3s
+# interval it burned 41% of a core continuously - the sampler became the
+# biggest CPU consumer on the Mac it was meant to be quietly observing.
+# Measured as duty cycle, not as one snapshot: `once` always pays the cold path
+# and would overstate the daemon's real cost. What matters is CPU per second of
+# wall clock, which is what burned 41% of a core.
+_duty="$("$BIN/tunnel-eventlog.sh" bench 8 2>/dev/null | awk '/duty cycle/{gsub("%","",$4); print $4}')"
+if awk -v d="$_duty" 'BEGIN{exit !(d+0 > 0 && d+0 < 5.0)}' 2>/dev/null; then
+  pass "the sampler costs under 5% of a core (measured ${_duty}%)"
+else
+  fail "the sampler costs under 5% of a core (measured ${_duty:-unknown}%)"
+fi
+
+# lsof cannot see sockets owned by root, so the root-owned bridge looked dead to
+# an unprivileged sampler and produced false "the bridge died" verdicts.
+if grep -q 'netstat' "$BIN/tunnel-eventlog.sh"; then
+  pass "port state comes from netstat, which sees root-owned listeners"
+else
+  fail "port state comes from netstat, which sees root-owned listeners"
+fi
+
 # The recorder must never become a cause of what it observes. Matched on the
 # MUTATING forms only: `networksetup -get...` and `pfctl -s` are reads, and the
 # script legitimately signals its own daemon to stop it.

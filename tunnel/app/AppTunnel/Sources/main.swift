@@ -770,23 +770,69 @@ final class Main: NSWindow {
         // Letting the timers also run made an indeterminate number of extra
         // frames land before capture, so no two renders matched.
         if !Render.deterministic {
-            Timer.scheduledTimer(withTimeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
-                self?.vis.step(); self?.lcd.advance(); self?.bars.step(); self?.pos.step()
-                self?.pulseLED()
-            }
+            retimeAnimation()
+            NotificationCenter.default.addObserver(
+                forName: NSWindow.didChangeOcclusionStateNotification,
+                object: self, queue: .main) { [weak self] _ in self?.retimeAnimation() }
             Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in
                 if Model.shared.poll() { self?.refresh() }
-    
+            }
         }
     }
+
+    // Animation is rate-limited by whether anything is actually moving and by
+    // whether anyone can see it.
+    //
+    // The timer used to run at a flat 30fps forever, stepping four views and
+    // marking the title bar dirty on every tick - even while the window was
+    // hidden behind other windows. Each of those frames also costs a
+    // WindowServer composite, so the pair sat at roughly 18% and 24% of a core
+    // with the tunnel completely idle. There is nothing to animate when no
+    // connection is in progress, and nothing at all to draw when the window is
+    // occluded.
+    private var animTimer: Timer?
+    private var animFPS: Double = -1
+
+    private func desiredFPS() -> Double {
+        guard occlusionState.contains(.visible) else { return 0 }
+        let m = Model.shared
+        return (m.connecting || m.demoMode) ? 30 : 4
+    }
+
+    func retimeAnimation() {
+        let fps = desiredFPS()
+        // Block-based timers carry no userInfo, so the current rate is tracked
+        // here; comparing against userInfo would never match and would rebuild
+        // the timer on every call.
+        if fps == animFPS, let t = animTimer, t.isValid { return }
+        animFPS = fps
+        animTimer?.invalidate()
+        animTimer = nil
+        guard fps > 0 else { return }
+        let t = Timer(timeInterval: 1.0 / fps, repeats: true) { [weak self] _ in
+            self?.vis.step(); self?.lcd.advance(); self?.bars.step(); self?.pos.step()
+            self?.pulseLED()
+        }
+        t.tolerance = (1.0 / fps) * 0.2   // let the OS coalesce wakeups
+        RunLoop.main.add(t, forMode: .common)
+        animTimer = t
     }
 
     private var ledPhase: CGFloat = 0
     private func pulseLED() {
         let m = Model.shared
-        ledPhase += 0.12
-        tb.ledPulse = (m.connecting || m.demoMode) ? CGFloat(abs(sin(ledPhase))) : 1
-        tb.needsDisplay = true
+        let animating = m.connecting || m.demoMode
+        var v: CGFloat = 1
+        if animating {
+            ledPhase += 0.12
+            v = CGFloat(abs(sin(ledPhase)))
+        }
+        // Only redraw when the value actually moved. Marking the title bar dirty
+        // every tick forced a composite for a pixel that had not changed.
+        if v != tb.ledPulse {
+            tb.ledPulse = v
+            tb.needsDisplay = true
+        }
     }
 
     private func layout() {
@@ -901,6 +947,9 @@ final class Main: NSWindow {
     }
 
     func refresh() {
+        // Connecting starts the LED pulsing and the phase animation, so the
+        // frame rate has to follow the state, not just window occlusion.
+        retimeAnimation()
         if hintOverride != nil { return }   // do not fight the hover description
         let m = Model.shared
         tb.led = m.failed ? Skin.red : m.sessionActive ? Skin.green
