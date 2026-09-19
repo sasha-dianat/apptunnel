@@ -810,8 +810,19 @@ final class Main: NSWindow {
         animTimer = nil
         guard fps > 0 else { return }
         let t = Timer(timeInterval: 1.0 / fps, repeats: true) { [weak self] _ in
-            self?.vis.step(); self?.lcd.advance(); self?.bars.step(); self?.pos.step()
-            self?.pulseLED()
+            guard let s = self else { return }
+            let m = Model.shared
+            if m.connecting || m.demoMode {
+                s.vis.step(); s.lcd.advance(); s.bars.step(); s.pos.step()
+                s.pulseLED()
+            } else {
+                // Idle: only the status readout needs a tick, and it redraws
+                // itself only when a displayed value has actually moved. The
+                // marquee, the phase bars and the position strip have nothing
+                // to advance while no connection is in progress, and stepping
+                // them marked the whole window dirty several times a second.
+                s.vis.step()
+            }
         }
         t.tolerance = (1.0 / fps) * 0.2   // let the OS coalesce wakeups
         RunLoop.main.add(t, forMode: .common)

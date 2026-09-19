@@ -1,8 +1,15 @@
-// Visualiser.swift — the dancing unit in the top left.
+// Visualiser.swift — the instrument in the top left.
 //
-// It used to be decoration: nineteen bars driven by random(), telling you
-// nothing. Now it is the instrument. Ten bands, one per health factor, fed by
-// the launcher's live sampler.
+// It began as decoration: nineteen bars driven by random(), telling you
+// nothing. It was then wired to the launcher's live sampler, which made the
+// bars honest but did not make them legible - a moving bar graph still reads
+// as a screensaver, and it cost a redraw plus a compositor pass thirty times a
+// second to say "still fine".
+//
+// So the DEFAULT is now STATUS: four numbers and a word, redrawn only when one
+// of them changes. A steady tunnel costs nothing between samples. The animated
+// modes are still here, one click away, for when the shape of a fault is more
+// useful than its name.
 //
 // A band at full height is healthy, so a FALLING bar is the alarm. That inverts
 // the classic peak-hold into a VALLEY-hold: the red tick marks the worst value
@@ -25,8 +32,14 @@ import AppKit
 final class Visualiser: NSView {
     var onHover: ((String?) -> Void)?
 
+    // Mode 0 is STATUS: a plain readout of the numbers that matter, drawn only
+    // when they change. The animated modes are real instruments fed by real
+    // telemetry, but a moving bar graph reads as decoration however honest its
+    // data is, and it costs a redraw plus a compositor pass thirty times a
+    // second to say "still fine". The default is now the boring one.
     var mode = 0
-    let modeCount = 6
+    let modeCount = 7
+    private var statusSig = ""
 
     private var shown     = [CGFloat](repeating: 0.04, count: BANDS.count)
     private var valley    = [CGFloat](repeating: 1.0,  count: BANDS.count)
@@ -47,7 +60,7 @@ final class Visualiser: NSView {
 
     override init(frame f: NSRect) {
         super.init(frame: f)
-        toolTip = "Live tunnel health. Click to cycle: neon · bands · radar · oscilloscope · signal path · latency history"
+        toolTip = "Tunnel status. Click to cycle: status · bands · radar · oscilloscope · signal path · latency history · neon"
         addTrackingArea(NSTrackingArea(rect: .zero,
                         options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways, .inVisibleRect],
                         owner: self))
@@ -61,9 +74,32 @@ final class Visualiser: NSView {
         needsDisplay = true
     }
 
+    /// What STATUS shows, as one string. Redrawing is driven by this changing,
+    /// so a steady tunnel costs nothing at all between samples.
+    private func statusSignature() -> String {
+        let m = Model.shared, tel = m.telemetry
+        var bad = 0, warn = 0
+        for i in 0..<BANDS.count {
+            let v = tel.values[i]
+            if v < 0 { continue }
+            if v < 0.34 && !BANDS[i].idleIsFine { bad += 1 }
+            else if v < 0.67 && !BANDS[i].idleIsFine { warn += 1 }
+        }
+        let rtt = tel.values.count > 5 ? Int(max(0, tel.values[5]) * 1000) : -1
+        return "\(tel.fresh)|\(tel.exitIP)|\(bad)|\(warn)|\(rtt)|\(Int(m.net.bytesPerSecond / 1024))|\(m.sessionActive)"
+    }
+
     func step() {
         let m = Model.shared
         let tel = m.telemetry
+
+        // STATUS animates nothing. Skip every smoothing accumulator below and
+        // only ask for a redraw when a displayed value actually moved.
+        if mode == 0 {
+            let sig = statusSignature()
+            if sig != statusSig { statusSig = sig; needsDisplay = true }
+            return
+        }
 
         for i in 0..<BANDS.count {
             let target: CGFloat = live
@@ -127,6 +163,7 @@ final class Visualiser: NSView {
     override func draw(_ r: NSRect) {
         Skin.lcd.setFill(); bounds.fill()
         switch mode {
+        case 0: drawStatus()
         case 1: live ? drawBands() : drawDeco()
         case 2: drawRadar()
         case 3: drawScope()
@@ -134,6 +171,55 @@ final class Visualiser: NSView {
         case 5: drawWaterfall()
         default: drawNeon()
         }
+    }
+
+    /// STATUS — the readout, not the light show.
+    ///
+    /// Answers the four questions the panel is actually consulted for: is the
+    /// tunnel carrying traffic, where does it come out, how far away is that,
+    /// and is anything unhealthy. Everything is a number or a word; the only
+    /// graphic is a ten-dot strip, one dot per factor, so a fault still points
+    /// at itself without needing a shape to be decoded.
+    private func drawStatus() {
+        let m = Model.shared, tel = m.telemetry
+        let small = Skin.mono(8, true)
+        let big   = Skin.mono(11, true)
+
+        var bad = 0, warn = 0
+        for i in 0..<BANDS.count {
+            let v = tel.values[i]
+            if v < 0 || BANDS[i].idleIsFine { continue }
+            if v < 0.34 { bad += 1 } else if v < 0.67 { warn += 1 }
+        }
+
+        let word: String
+        let tint: NSColor
+        if !tel.fresh      { word = "NO DATA";  tint = Skin.label }
+        else if bad > 0    { word = "FAULT";    tint = Skin.red }
+        else if warn > 0   { word = "DEGRADED"; tint = Skin.amber }
+        else               { word = "SECURE";   tint = Skin.green }
+        text(word, NSPoint(x: 8, y: bounds.height - 16), big, tint)
+
+        // Ten dots, one per factor. Position is the band, colour is its health.
+        let dotY = bounds.height - 26
+        for i in 0..<BANDS.count {
+            let v = tel.values[i]
+            let c: NSColor = !tel.fresh || v < 0 ? Skin.metalHi
+                           : (BANDS[i].idleIsFine || v >= 0.67) ? Skin.greenMid
+                           : v >= 0.34 ? Skin.amber : Skin.red
+            c.setFill()
+            NSBezierPath(ovalIn: NSRect(x: 8 + CGFloat(i) * 9, y: dotY, width: 5, height: 5)).fill()
+        }
+
+        let ip = tel.exitIP.isEmpty ? "—" : tel.exitIP
+        text("EXIT \(ip)", NSPoint(x: 8, y: dotY - 13), small, Skin.label)
+
+        let rttMs = tel.values.count > 5 && tel.values[5] >= 0 ? Int(tel.values[5] * 1000) : -1
+        let rttStr = rttMs < 0 ? "—" : "\(rttMs)ms"
+        let kb = m.net.bytesPerSecond / 1024.0
+        let flow = kb < 1 ? "idle" : (kb < 1024 ? String(format: "%.0f KB/s", kb)
+                                                : String(format: "%.1f MB/s", kb / 1024))
+        text("RTT \(rttStr)   FLOW \(flow)", NSPoint(x: 8, y: dotY - 24), small, Skin.label)
     }
 
     // MARK: modes
