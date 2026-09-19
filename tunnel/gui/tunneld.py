@@ -10,6 +10,7 @@ It does NOT change any macOS network setting. There is no code path here that
 runs networksetup, ipconfig, route, or scutil in write mode.
 """
 
+import datetime
 import json
 import os
 import re
@@ -322,6 +323,16 @@ class Handler(BaseHTTPRequestHandler):
             sess = session_state()
             if not sess:
                 return self._send(404, {"error": "no session running"})
+            # Leave provenance before signalling. A bare SIGTERM is
+            # indistinguishable afterwards from the launcher crashing, and
+            # tunnel-forensics.sh would report a crash for a deliberate stop.
+            try:
+                with open(os.path.join(STATE_DIR, "stop"), "w") as f:
+                    json.dump({"who": "AppTunnel web GUI (/api/stop)",
+                               "pid": os.getpid(),
+                               "at": datetime.datetime.now().isoformat(timespec="seconds")}, f)
+            except Exception:
+                pass
             try:
                 os.kill(int(sess["pid"]), signal.SIGTERM)
             except Exception as e:

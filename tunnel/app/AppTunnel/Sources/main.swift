@@ -1012,7 +1012,17 @@ final class Main: NSWindow {
             warn("No running session.", "Nothing to disconnect."); return
         }
         // The launcher is root-owned, so we ask it to stop via a flag file it polls.
-        FileManager.default.createFile(atPath: m.stopFile, contents: Data())
+        //
+        // The file carries provenance rather than being empty. "The tunnel
+        // dropped" has many possible causes and they look identical afterwards;
+        // recording who asked, from which process, at what moment is the one
+        // fact that cannot be reconstructed later. tunnel-forensics.sh reads it.
+        let stamp = ISO8601DateFormatter().string(from: Date())
+        let info = "{\"who\":\"AppTunnel stop button\",\"pid\":"
+                 + "\(ProcessInfo.processInfo.processIdentifier),"
+                 + "\"user\":\"\(NSUserName())\",\"at\":\"\(stamp)\"}"
+        FileManager.default.createFile(atPath: m.stopFile,
+                                       contents: info.data(using: .utf8))
         m.lastMessage = "stop requested — restoring system state…"
         refresh()
     }

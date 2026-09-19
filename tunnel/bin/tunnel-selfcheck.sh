@@ -272,6 +272,31 @@ else
   fail "the VPN repair runs as the user, not as root"
 fi
 
+# Attributing a disconnection afterwards is impossible unless the one fact that
+# cannot be reconstructed - who asked for the stop - is written down at the time.
+for f in tunnel-eventlog.sh tunnel-forensics.sh; do
+  [ -x "$BIN/$f" ] && pass "$f exists and is executable" || fail "$f exists and is executable"
+  bash -n "$BIN/$f" 2>/dev/null && pass "$f parses" || fail "$f parses"
+done
+grep -q 'who.*AppTunnel stop button' "$SRC" 2>/dev/null \
+  && pass "the stop button records who requested the stop" \
+  || fail "the stop button records who requested the stop"
+grep -q '"who": "AppTunnel web GUI' "$BIN/../gui/tunneld.py" 2>/dev/null \
+  && pass "the web GUI stop records its provenance too" \
+  || fail "the web GUI stop records its provenance too"
+grep -q 'stop_who=' "$BIN/tunnel-lock.sh" \
+  && pass "the launcher logs the stop provenance it was given" \
+  || fail "the launcher logs the stop provenance it was given"
+# The recorder must never become a cause of what it observes. Matched on the
+# MUTATING forms only: `networksetup -get...` and `pfctl -s` are reads, and the
+# script legitimately signals its own daemon to stop it.
+if grep -qE 'networksetup +-set|pfctl +-(F|e|d|f)\b|dseditgroup +-o +(create|delete|edit)|route +(add|delete)' \
+        "$BIN/tunnel-eventlog.sh"; then
+  fail "tunnel-eventlog.sh only observes, never changes system state"
+else
+  pass "tunnel-eventlog.sh only observes, never changes system state"
+fi
+
 # SUDO_USER can be inherited as "root" through a sudo chain, which made the
 # doctor abort after one line and show an almost-empty window.
 for f in tunnel-doctor.sh tunnel-freehost.sh tunnel-testkit.sh; do

@@ -1406,7 +1406,10 @@ while any_alive; do
   # The app requests shutdown by creating this file; it cannot signal a
   # root-owned launcher directly.
   if [ -f "$STOP_FILE" ]; then
-    log "Stop requested from AppTunnel; dropping the network, apps left running."
+    # Record WHO asked. The stop file carries provenance; without it a
+    # deliberate stop is indistinguishable afterwards from a crash.
+    stop_who="$(head -c 400 "$STOP_FILE" 2>/dev/null || true)"
+    log "Stop requested; dropping the network, apps left running. ${stop_who:-(no provenance recorded)}"
     emit 97 STOPPING run "stop requested"
     # Stop tears the tunnel down; it does not close the apps. They keep running
     # with no route out, hold their gid, and are adopted again by the next
