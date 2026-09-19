@@ -118,9 +118,33 @@ if [ "${1:-}" = "--stop" ]; then
     ok "system proxy released"
     inf "this network DPI-blocks direct HTTPS; expect no internet until a tunnel is up"
   fi
+  # TERM, verify, then KILL, then verify again. A single unverified TERM left a
+  # second core alive once: it kept serving 1081/1091, so the system proxy still
+  # pointed at a live VeePN exit and the reported IP never changed - exactly the
+  # "disconnected but still connected" symptom this command exists to cure.
   pids="$(core_pids)"
-  if [ -n "$pids" ]; then kill -TERM $pids 2>/dev/null; ok "our core stopped"; else inf "our core was not running"; fi
+  if [ -n "$pids" ]; then
+    kill -TERM $pids 2>/dev/null
+    i=0; while [ "$i" -lt 20 ] && [ -n "$(core_pids)" ]; do sleep 0.25; i=$((i+1)); done
+    left="$(core_pids)"
+    [ -n "$left" ] && { kill -KILL $left 2>/dev/null; sleep 1; }
+    if [ -n "$(core_pids)" ]; then
+      bad "a core would not exit: $(core_pids | tr '\n' ' ')"
+    else
+      ok "our core stopped"
+    fi
+  else
+    inf "our core was not running"
+  fi
   clear_state
+
+  # The ports are the thing that actually matters: while either is still served,
+  # anything pointed at them keeps exiting through VeePN.
+  still="$(/usr/sbin/netstat -an -p tcp 2>/dev/null \
+    | awk -v s=".$SOCKS_PORT" -v h=".$HTTP_PORT" \
+      '$6=="LISTEN" && ($4 ~ s"$" || $4 ~ h"$"){printf "%s ", $4}')"
+  [ -n "$still" ] && bad "still serving: $still - something else is bound there" \
+                  || ok "$SOCKS_PORT and $HTTP_PORT released"
   printf '\n'
   exit 0
 fi
