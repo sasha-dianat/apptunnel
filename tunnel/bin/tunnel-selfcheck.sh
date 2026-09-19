@@ -13,6 +13,11 @@
 
 set -uo pipefail
 
+# The system python3 at /usr/bin is a Command Line Tools stub: it exists and is
+# executable even when the Tools are not installed, and then every call dies
+# with "invalid active developer path". This resolves one that actually runs.
+. "$(cd "$(dirname "$0")" && pwd)/tunnel-python.sh"
+
 BIN="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(dirname "$BIN")"
 APPDIR="$(dirname "$ROOT")"
@@ -47,7 +52,7 @@ assert_not_contains() {
 # ---- protect the user's real state ----------------------------------------
 LIVE_SESSION=0
 if [ -f "$STATE_DIR/session.json" ]; then
-  pid="$(/usr/bin/python3 -c 'import json,sys
+  pid="$("$PY" -c 'import json,sys
 try: print(json.load(open(sys.argv[1])).get("pid",""))
 except Exception: pass' "$STATE_DIR/session.json" 2>/dev/null)"
   [ -n "$pid" ] && ps -p "$pid" >/dev/null 2>&1 && LIVE_SESSION=1
@@ -88,6 +93,35 @@ for f in "$BIN"/tunnel-*.sh; do
   [ -x "$f" ] && pass "$n is executable" || fail "$n is executable"
 done
 
+# The defect that made the whole toolkit inert on a Mac with no Command Line
+# Tools: /usr/bin/python3 is an xcrun stub, so `command -v python3` succeeded
+# while every actual call died with "invalid active developer path". The SOCKS
+# probe, the bridge, the JSON parsing and the telemetry sampler all went through
+# it, so the app stalled on phase 2 and the analyser stayed blank.
+# The pattern is assembled from pieces rather than written out, so that this
+# test does not match its own source - the same trap the port-53 check fell
+# into, where the comment explaining a bug was read as the bug.
+STUB="/usr/bin/""python3"
+for f in "$BIN"/tunnel-*.sh; do
+  n="$(basename "$f")"
+  [ "$n" = "tunnel-python.sh" ] && continue          # the resolver names it on purpose
+  if grep -vE '^[[:space:]]*#' "$f" | grep -q "$STUB"; then
+    fail "$n resolves python3 instead of hardcoding the stub" \
+         "found a literal $STUB call"
+  else
+    pass "$n resolves python3 instead of hardcoding the stub"
+  fi
+done
+if [ "${TUNNEL_PY_OK:-0}" -eq 1 ] && "$PY" -c 'import json,socket' >/dev/null 2>&1; then
+  pass "a working python3 was resolved ($PY)"
+else
+  fail "a working python3 was resolved" \
+       "none of the candidates ran - install the Command Line Tools: xcode-select --install"
+fi
+grep -q 'TUNNEL_PY_OK' "$BIN/tunnel-lock.sh" \
+  && pass "the launcher preflight RUNS python3 rather than trusting command -v" \
+  || fail "the launcher preflight RUNS python3 rather than trusting command -v"
+
 # The defect that took the Mac's DNS away: an unscoped port-53 block.
 # Comments must be excluded - the file documents the old bug, and matching that
 # text made this test fail against its own explanation.
@@ -111,6 +145,19 @@ fi
 grep -q 'only_pids' "$BIN/tunnel-connect.sh" \
   && pass "tunnel-connect.sh filters the kill list to bare pids" \
   || fail "tunnel-connect.sh filters the kill list to bare pids"
+
+# Validate-after-destroy: the launcher retired the running session BEFORE
+# tunnel-lock.sh reached its phase-2 SOCKS check, so pressing Run while the VPN
+# was down killed a working tunnel and every app inside it, then failed anyway
+# and left the user with nothing. Preconditions must be proven before the first
+# kill signal, not after.
+precheck_ln="$(grep -n 'require_socks_endpoint' "$BIN/tunnel-connect.sh" | head -1 | cut -d: -f1)"
+firstkill_ln="$(grep -n 'kill -TERM' "$BIN/tunnel-connect.sh" | head -1 | cut -d: -f1)"
+if [ -n "$precheck_ln" ] && [ -n "$firstkill_ln" ] && [ "$precheck_ln" -lt "$firstkill_ln" ]; then
+  pass "tunnel-connect.sh proves the SOCKS endpoint before it kills anything"
+else
+  fail "tunnel-connect.sh proves the SOCKS endpoint before it kills anything"
+fi
 
 # SUDO_USER can be inherited as "root" through a sudo chain, which made the
 # doctor abort after one line and show an almost-empty window.
@@ -145,7 +192,7 @@ case "$mygname" in
       fail "the login keychain is reachable (saved sign-ins will persist)" \
            "only the System keychain is visible - this app will ask you to sign in every launch"
     fi
-    auid="$(/usr/bin/python3 -c '
+    auid="$("$PY" -c '
 import ctypes, ctypes.util
 lib = ctypes.CDLL(ctypes.util.find_library("System"))
 v = ctypes.c_uint32()
@@ -272,7 +319,7 @@ if [ ! -x "$BIN/tunnel-telemetry.sh" ]; then
 else
   pass "tunnel-telemetry.sh exists and is executable"
   tsout="$("$BIN/tunnel-telemetry.sh" 2>/dev/null)"
-  if /usr/bin/python3 -c '
+  if "$PY" -c '
 import json, sys
 d = json.loads(sys.argv[1])
 need = ["t","link","dns","socks","bridge","exit","rtt","flow","seal","wall","grip","score"]
@@ -289,9 +336,9 @@ assert isinstance(d.get("detail"), dict), "detail must be an object"
   else
     fail "the sampler emits a valid, in-range telemetry object" "got: $(printf '%s' "$tsout" | head -c 160)"
   fi
-  st="$(/usr/bin/python3 -c 'import time;print(time.time())')"
+  st="$("$PY" -c 'import time;print(time.time())')"
   "$BIN/tunnel-telemetry.sh" >/dev/null 2>&1
-  el="$(/usr/bin/python3 -c 'import sys,time;print(int((time.time()-float(sys.argv[1]))*1000))' "$st")"
+  el="$("$PY" -c 'import sys,time;print(int((time.time()-float(sys.argv[1]))*1000))' "$st")"
   if [ "${el:-9999}" -lt 8000 ]; then
     pass "a sampling pass completes in ${el}ms (< 8s budget)"
   else
@@ -381,7 +428,7 @@ if [ "$LIVE_SESSION" = 1 ]; then
   skip "session lock tests (a real session is running)"
 else
   note_created session.json
-  /usr/bin/python3 -c 'import json,os,sys;json.dump({"pid":os.getpid(),"state":"test"},open(sys.argv[1],"w"))' \
+  "$PY" -c 'import json,os,sys;json.dump({"pid":os.getpid(),"state":"test"},open(sys.argv[1],"w"))' \
     "$STATE_DIR/session.json"
   # our python already exited, so that pid is dead -> stale, must be reclaimed
   out="$("$BIN/tunnel-lock.sh" --self-test --socks-port 9 2>&1)"
@@ -395,7 +442,7 @@ else
   # script's stdout keeps the pipe open, so `selfcheck | sed` would block until
   # the sleep expired. That is what made this suite appear to hang.
   sleep 20 >/dev/null 2>&1 & live=$!
-  /usr/bin/python3 -c 'import json,sys;json.dump({"pid":int(sys.argv[2]),"state":"test"},open(sys.argv[1],"w"))' \
+  "$PY" -c 'import json,sys;json.dump({"pid":int(sys.argv[2]),"state":"test"},open(sys.argv[1],"w"))' \
     "$STATE_DIR/session.json" "$live"
   out="$("$BIN/tunnel-lock.sh" --self-test --socks-port 9 2>&1)"
   assert_contains "a live lock blocks a second run" "already running" "$out"
@@ -413,7 +460,7 @@ assert_contains "testkit reports 'not armed' when cleared" "not armed" "$out"
 
 out="$("$BIN/tunnel-testkit.sh" protect --pid $$ 2>&1)"
 assert_contains "testkit arms protection" "Protection armed" "$out"
-host="$(/usr/bin/python3 -c 'import json,os
+host="$("$PY" -c 'import json,os
 try: print(json.load(open(os.path.expanduser("~/.apptunnel/protected.json"))).get("host_bundle",""))
 except Exception: pass' 2>/dev/null)"
 case "$host" in
@@ -428,7 +475,7 @@ if [ "$LIVE_SESSION" = 1 ] || [ -z "$host" ]; then
   skip "all-protected roster test"
 else
   note_created apps.json
-  /usr/bin/python3 -c 'import json,sys
+  "$PY" -c 'import json,sys
 json.dump([{"path":sys.argv[2],"name":"Host","enabled":True}], open(sys.argv[1],"w"))' \
     "$STATE_DIR/apps.json" "$host"
   out="$("$BIN/tunnel-lock.sh" --app "$host" --yes 2>&1)"
@@ -502,6 +549,24 @@ else
   file "$APP/Contents/MacOS/AppTunnel" 2>/dev/null | grep -q 'Mach-O' \
     && pass "the binary is Mach-O" || fail "the binary is Mach-O"
 
+  # There are two bundles: the build output under tunnel/app/ and the one the
+  # README tells you to double-click at the project root. build.sh used to
+  # produce only the first, so they drifted weeks apart - every fix landed in a
+  # bundle nobody opened while the root copy stayed frozen, which is exactly how
+  # the app came to look unfixable.
+  BUILT="$ROOT/app/AppTunnel.app/Contents/MacOS/AppTunnel"
+  if [ ! -f "$BUILT" ]; then
+    skip "the installed app matches the build output (nothing built yet)"
+  elif cmp -s "$BUILT" "$APP/Contents/MacOS/AppTunnel"; then
+    pass "the installed app matches the build output"
+  else
+    fail "the installed app matches the build output" \
+         "$APP is stale - re-run app/build.sh, which now installs it"
+  fi
+  grep -q 'ditto "$APP" "$INSTALLED"' "$ROOT/app/build.sh" \
+    && pass "build.sh installs the bundle the user actually opens" \
+    || fail "build.sh installs the bundle the user actually opens"
+
   grep -q 'tell application "Terminal"' "$ROOT/app/AppTunnel/Sources/main.swift" \
     && fail "the app never opens Terminal" || pass "the app never opens Terminal"
   grep -q 'with administrator privileges' "$ROOT/app/AppTunnel/Sources/main.swift" \
@@ -511,6 +576,63 @@ else
        "$ROOT/app/AppTunnel/Sources/main.swift" \
     && pass "the app tells root-run helpers which login user to act for" \
     || fail "the app tells root-run helpers which login user to act for"
+
+  # ---- Sonoma compatibility -------------------------------------------------
+  # The windows are borderless and drawn by hand, so the app shipped with no
+  # NSMainMenu at all. Without one macOS has no key-equivalent table: Command-Q
+  # did nothing, and the only way out was the painted X.
+  # Bounded: a binary that predates --dump-menu does not recognise the flag and
+  # just opens its window, holding the command substitution open forever. macOS
+  # ships no timeout(1), so the wait is done by hand.
+  menu_out="$SANDBOX/menu.txt"
+  "$APP/Contents/MacOS/AppTunnel" --dump-menu >"$menu_out" 2>/dev/null &
+  menu_pid=$!
+  waited=0
+  while [ "$waited" -lt 15 ] && kill -0 "$menu_pid" 2>/dev/null; do
+    sleep 1; waited=$((waited+1))
+  done
+  kill -0 "$menu_pid" 2>/dev/null && kill "$menu_pid" 2>/dev/null
+  wait "$menu_pid" 2>/dev/null
+  menu="$(cat "$menu_out" 2>/dev/null)"
+  if [ -z "$menu" ]; then
+    fail "the app installs a main menu (Command-Q works)" \
+         "--dump-menu produced nothing - the bundled binary predates the fix, rebuild with app/build.sh"
+  else
+    assert_contains "Command-Q is bound to terminate:" "cmd+q	terminate:" "$menu"
+    assert_contains "Command-W is bound to performClose:" "cmd+w	performClose:" "$menu"
+    assert_contains "Command-M is bound to performMiniaturize:" "cmd+m	performMiniaturize:" "$menu"
+  fi
+
+  # macOS 14 made the "ignoring" half of activate(ignoringOtherApps:) a no-op
+  # for apps not started by a user gesture - which is exactly how the launcher
+  # starts this one - so the window was created but stayed behind everything.
+  grep -q 'orderFrontRegardless' "$ROOT/app/AppTunnel/Sources/main.swift" \
+    && pass "the window is raised with orderFrontRegardless (Sonoma activation)" \
+    || fail "the window is raised with orderFrontRegardless (Sonoma activation)" \
+            "activate(ignoringOtherApps:) alone leaves the window behind other apps on macOS 14+"
+  grep -q 'applicationSupportsSecureRestorableState' "$ROOT/app/AppTunnel/Sources/main.swift" \
+    && pass "secure restorable state is answered (no Sonoma launch warning)" \
+    || fail "secure restorable state is answered (no Sonoma launch warning)"
+
+  # A binary pinned to one architecture needs Rosetta on the other, and Rosetta
+  # is not installed by default - the app simply refuses to open there.
+  # file(1), not lipo(1): lipo is an xcrun stub that dies when the Command Line
+  # Tools are missing, which reported every binary as "unknown".
+  hostarch="$(uname -m)"
+  archs="$(file "$APP/Contents/MacOS/AppTunnel" 2>/dev/null)"
+  case "$archs" in
+    *"$hostarch"*) pass "the binary contains this Mac's architecture ($hostarch)" ;;
+    *) fail "the binary contains this Mac's architecture" \
+            "host is $hostarch; file(1) says: ${archs:-unknown}" ;;
+  esac
+  if grep -q 'for arch in .*arm64' "$ROOT/app/build.sh" \
+     && grep -q 'for arch in .*x86_64' "$ROOT/app/build.sh" \
+     && grep -q 'lipo -create' "$ROOT/app/build.sh"; then
+    pass "build.sh builds a universal binary"
+  else
+    fail "build.sh builds a universal binary" \
+         "a single -target produces a binary that needs Rosetta on the other architecture"
+  fi
 
   # Render tests. A view that fails to lay out produces a nearly blank PNG,
   # which compresses far smaller than one containing text - that is exactly how

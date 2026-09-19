@@ -27,6 +27,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 BIN = os.path.normpath(os.path.join(HERE, "..", "bin"))
 LOCK = os.path.join(BIN, "tunnel-lock.sh")
 DOCTOR = os.path.join(BIN, "tunnel-doctor.sh")
+REPAIR = os.path.join(BIN, "tunnel-veepn-repair.sh")
 STATE_DIR = os.path.expanduser("~/.apptunnel")
 APPS_FILE = os.path.join(STATE_DIR, "apps.json")
 EVENTS = os.path.join(STATE_DIR, "events.jsonl")
@@ -333,12 +334,22 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(500, {"error": err or out})
             return self._send(200, {"ok": True})
 
+        # Bring the SOCKS endpoint up. Needs no root and touches no session, so
+        # it is safe to press while a tunnel is running; Run refuses to start
+        # without an endpoint, and this is what supplies one.
+        if u.path == "/api/repair":
+            argv = [REPAIR] + (["--status"] if body.get("status") else [])
+            rc, out, err = terminal(argv, "repair VeePN tunnel")
+            if rc != 0:
+                return self._send(500, {"error": err or out})
+            return self._send(200, {"ok": True})
+
         return self._send(404, {"error": "unknown endpoint"})
 
 
 def main():
     os.makedirs(STATE_DIR, exist_ok=True)
-    for p in (LOCK, DOCTOR):
+    for p in (LOCK, DOCTOR, REPAIR):
         if os.path.isfile(p):
             os.chmod(p, 0o755)
     srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
