@@ -12,6 +12,11 @@
 
 set -uo pipefail
 
+# The system python3 at /usr/bin is a Command Line Tools stub: it exists and is
+# executable even when the Tools are not installed, and then every call dies
+# with "invalid active developer path". This resolves one that actually runs.
+. "$(cd "$(dirname "$0")" && pwd)/tunnel-python.sh"
+
 GID=""; ANCHOR=""; BRIDGE=""; BASE_EXIT=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -25,7 +30,7 @@ done
 
 # ms taken by a TCP connect, or -1 if it did not connect within `t` seconds.
 connect_ms() {
-  /usr/bin/python3 -c '
+  "$PY" -c '
 import socket, sys, time
 host, port, t = sys.argv[1], int(sys.argv[2]), float(sys.argv[3])
 s = socket.socket(); s.settimeout(t)
@@ -41,7 +46,7 @@ finally:
 
 # 1.0 at or below `good` ms, ~0 at or above `bad` ms, linear between.
 grade() {
-  /usr/bin/python3 -c '
+  "$PY" -c '
 import sys
 v, good, bad = float(sys.argv[1]), float(sys.argv[2]), float(sys.argv[3])
 if v < 0: print(0.0)
@@ -64,9 +69,9 @@ else
 fi
 
 # --- 2 DNS ----------------------------------------------------------------
-dstart="$(/usr/bin/python3 -c 'import time;print(time.time())')"
+dstart="$("$PY" -c 'import time;print(time.time())')"
 if [ -n "$(dig +time=2 +tries=1 +short www.wikipedia.org @1.1.1.1 2>/dev/null)" ]; then
-  dms="$(/usr/bin/python3 -c 'import sys,time;print(int((time.time()-float(sys.argv[1]))*1000))' "$dstart")"
+  dms="$("$PY" -c 'import sys,time;print(int((time.time()-float(sys.argv[1]))*1000))' "$dstart")"
   DNS="$(grade "$dms" 120 2000)"; D_DNS="${dms}ms"
 else
   DNS=0.0; D_DNS="no resolution"
@@ -98,11 +103,11 @@ if [ -n "$BRIDGE" ]; then
     BRIDGE_V="$(grade "$bms" 100 600)"; D_BRIDGE="${bms}ms"
   fi
 
-  rstart="$(/usr/bin/python3 -c 'import time;print(time.time())')"
+  rstart="$("$PY" -c 'import time;print(time.time())')"
   ip="$(/usr/bin/curl -4fsS -x "$BRIDGE" --noproxy '' --connect-timeout 4 --max-time 8 \
         https://api.ipify.org 2>/dev/null || true)"
   if printf '%s' "$ip" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
-    rms="$(/usr/bin/python3 -c 'import sys,time;print(int((time.time()-float(sys.argv[1]))*1000))' "$rstart")"
+    rms="$("$PY" -c 'import sys,time;print(int((time.time()-float(sys.argv[1]))*1000))' "$rstart")"
     RTT="$(grade "$rms" 150 2500)"; D_RTT="${rms}ms"
     if [ -z "$BASE_EXIT" ] || [ "$ip" = "$BASE_EXIT" ]; then
       EXIT_V=1.0; D_EXIT="$ip"
@@ -123,7 +128,7 @@ fi
 if [ -n "$BRIDGE" ]; then
   fport="$(printf '%s' "$BRIDGE" | sed -e 's|.*:||' -e 's|/.*||')"
   conns="$(netstat -an -p tcp 2>/dev/null | grep -c "\.${fport}.*ESTABLISHED" || true)"
-  FLOW="$(/usr/bin/python3 -c '
+  FLOW="$("$PY" -c '
 import math, sys
 n = int(sys.argv[1] or 0)
 print(round(min(1.0, math.log1p(n) / math.log1p(24)), 3))
@@ -139,7 +144,7 @@ fi
 if [ -n "$GID" ] && [ "$(id -u)" -eq 0 ]; then
   gname="$(dscl . -list /Groups PrimaryGroupID 2>/dev/null | awk -v g="$GID" '$2==g{print $1; exit}')"
   if [ -n "$gname" ]; then
-    reach="$(sudo -n -u "${SUDO_USER:-root}" -g "$gname" /usr/bin/python3 -c '
+    reach="$(sudo -n -u "${SUDO_USER:-root}" -g "$gname" "$PY" -c '
 import socket
 n = 0
 for host, port in (("1.1.1.1",443), ("8.8.8.8",53), ("9.9.9.9",443)):
@@ -197,7 +202,7 @@ else
 fi
 
 # --- emit -----------------------------------------------------------------
-/usr/bin/python3 -c '
+"$PY" -c '
 import json, sys, time
 keys = ["link","dns","socks","bridge","exit","rtt","flow","seal","wall","grip"]
 vals = [float(v) for v in sys.argv[1:11]]

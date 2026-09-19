@@ -17,6 +17,11 @@
 
 set -uo pipefail
 
+# The system python3 at /usr/bin is a Command Line Tools stub: it exists and is
+# executable even when the Tools are not installed, and then every call dies
+# with "invalid active developer path". This resolves one that actually runs.
+. "$(cd "$(dirname "$0")" && pwd)/tunnel-python.sh"
+
 BIN="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(dirname "$BIN")"
 APPDIR="$(dirname "$ROOT")"
@@ -134,7 +139,7 @@ say "8. Starting the tunnel"
 APPS=()
 if [ -f "$ROSTER" ]; then
   while IFS= read -r p; do [ -n "$p" ] && APPS+=(--app "$p"); done < <(
-    /usr/bin/python3 -c '
+    "$PY" -c '
 import json,sys
 try:
     for a in json.load(open(sys.argv[1])):

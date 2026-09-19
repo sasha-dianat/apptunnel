@@ -60,6 +60,7 @@ final class Model {
     /// Bundles currently running inside the tunnel's isolation group.
     var tunnelled: Set<String> = []
     let telemetry = TelemetryStore()
+    let net = ThroughputMeter()
     var runFile: String { stateDir + "/run-request" }
     private var scanTick = 0
     var startedAt: Date?
@@ -130,6 +131,7 @@ final class Model {
         }
         if !demoMode && consumeEvents() { dirty = true }
         if !demoMode && telemetry.poll() { dirty = true }
+        if net.sample() { dirty = true }
         return dirty
     }
 
@@ -699,6 +701,9 @@ final class LogWindow: NSWindow {
 
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
+    /// Command-W closes the panel rather than beeping (no .closable in the mask)
+    /// and must NOT quit the app - only the main window means that.
+    override func performClose(_ sender: Any?) { close() }
     func append(_ s: String) { tv.string += s; tv.scrollToEndOfDocument(nil) }
 }
 
@@ -1202,6 +1207,11 @@ final class Main: NSWindow {
 
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
+
+    /// Command-W. A borderless window has no close button, so the stock
+    /// performClose: would just beep. This is the single window of the app, and
+    /// the painted X quits, so Command-W means the same thing.
+    override func performClose(_ sender: Any?) { NSApp.terminate(nil) }
 }
 
 // MARK: - Delegate
@@ -1210,6 +1220,18 @@ final class Delegate: NSObject, NSApplicationDelegate {
     var win: Main?
 
     func applicationDidFinishLaunching(_ n: Notification) {
+        // Before anything that can show an alert: without a main menu there are
+        // no key equivalents at all, so Command-Q is dead even on the error path.
+        AppMenu.install()
+
+        // Lets the suite prove the shortcuts are really bound, rather than
+        // grepping the source and hoping. Prints one "title<tab>modifiers+key"
+        // line per item and exits.
+        if CommandLine.arguments.contains("--dump-menu") {
+            print(AppMenu.describe())
+            exit(0)
+        }
+
         let m = Model.shared
         var dir = (Bundle.main.bundlePath as NSString).deletingLastPathComponent
         let fm = FileManager.default
@@ -1234,7 +1256,7 @@ final class Delegate: NSObject, NSApplicationDelegate {
         w.makeKeyAndOrderFront(nil)
         w.refresh()
         win = w
-        NSApp.activate(ignoringOtherApps: true)
+        comeToFront(w)
 
         let args = CommandLine.arguments
         // Any snapshot mode renders deterministically so the suite can compare.
@@ -1265,6 +1287,7 @@ final class Delegate: NSObject, NSApplicationDelegate {
             _ = m.telemetry.poll()
             // Optional trailing arg picks the analyser mode to capture.
             if i + 2 < args.count, let md = Int(args[i + 2]) { w.vis.mode = md }
+            if i + 3 < args.count, let fl = Double(args[i + 3]) { m.net.pinned = fl }
             for _ in 0..<120 { w.vis.step() }
             w.refresh()
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
@@ -1319,6 +1342,32 @@ final class Delegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Raise the window on Sonoma, where the old incantation stopped working.
+    ///
+    /// macOS 14 deprecated `activate(ignoringOtherApps:)` and, more to the
+    /// point, made the "ignoring" half a no-op: an app that was not started by
+    /// a user gesture is no longer allowed to steal focus. This app IS started
+    /// that way - the launcher spawns it from a detached shell - so on Sonoma
+    /// the window was created, ordered front within our own (inactive) app, and
+    /// left sitting behind everything else. From the user's side the app simply
+    /// did not appear.
+    ///
+    /// `orderFrontRegardless()` is the part that still works unconditionally:
+    /// it puts the window above other applications' windows without requiring
+    /// activation. The activate call is kept for the keyboard focus, using the
+    /// modern spelling where it exists, and is repeated once on the next runloop
+    /// pass because the launcher's own activation can land a beat after ours.
+    private func comeToFront(_ w: NSWindow) {
+        func raise() {
+            if #available(macOS 14.0, *) { NSApp.activate() }
+            else { NSApp.activate(ignoringOtherApps: true) }
+            w.orderFrontRegardless()
+            w.makeKey()
+        }
+        raise()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { raise() }
+    }
+
     private func snapshot(_ w: Main, to out: String) {
         let m = Model.shared
         m.demoMode = true; m.socksUp = true
@@ -1351,6 +1400,20 @@ final class Delegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ a: NSApplication) -> Bool { false }
+
+    /// Sonoma logs a warning on every launch when this is unanswered, and opts
+    /// the app into the legacy insecure restorable-state path. We restore
+    /// nothing from disk, so the secure coder is simply correct here.
+    @available(macOS 12.0, *)
+    func applicationSupportsSecureRestorableState(_ a: NSApplication) -> Bool { true }
+
+    /// Clicking the Dock icon with the window hidden or minimised must bring it
+    /// back. Without this the app looks gone while still running, because
+    /// terminate-after-last-window is off.
+    func applicationShouldHandleReopen(_ a: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if let w = win { comeToFront(w) }
+        return true
+    }
 }
 
 let app = NSApplication.shared

@@ -40,6 +40,11 @@
 
 set -euo pipefail
 
+# The system python3 at /usr/bin is a Command Line Tools stub: it exists and is
+# executable even when the Tools are not installed, and then every call dies
+# with "invalid active developer path". This resolves one that actually runs.
+. "$(cd "$(dirname "$0")" && pwd)/tunnel-python.sh"
+
 VERSION="2.1"
 # Defaults only. The real endpoint is discovered from the system proxy
 # configuration, which the VPN client itself writes: VeePN uses 1180 on some
@@ -111,7 +116,7 @@ CUR_NAME="INIT"
 # Machine-readable phase events consumed by the GUI's animation.
 emit() {
   local n="$1" name="$2" status="$3" msg="${4:-}"
-  /usr/bin/python3 -c 'import json,sys,time
+  "$PY" -c 'import json,sys,time
 print(json.dumps({"t":time.time(),"phase":int(sys.argv[1]),"name":sys.argv[2],
                   "status":sys.argv[3],"msg":sys.argv[4]}), flush=True)' \
     "$n" "$name" "$status" "$msg" >> "$EVENT_LOG" 2>/dev/null || true
@@ -173,7 +178,7 @@ prepare_user_config_access() {
   done
 
   if [ -e "$SETTINGS_FILE" ]; then
-    /usr/bin/python3 - "$SETTINGS_FILE" <<'PY' \
+    "$PY" - "$SETTINGS_FILE" <<'PY' \
       || die "Claude settings are not valid JSON: $SETTINGS_FILE"
 import json, sys
 with open(sys.argv[1], encoding="utf-8") as handle:
@@ -273,7 +278,7 @@ note_problem() {
 restore_settings() {
   (( SETTINGS_PATCHED )) || return 0
   [ -f "$SETTINGS_STATE" ] || return 0
-  if /usr/bin/python3 - "$SETTINGS_FILE" "$SETTINGS_STATE" <<'PY'
+  if "$PY" - "$SETTINGS_FILE" "$SETTINGS_STATE" <<'PY'
 import json, os, sys, tempfile
 settings_path, state_path = sys.argv[1:3]
 with open(state_path) as f:
@@ -313,7 +318,7 @@ PY
 restore_codex_env() {
   (( CODEX_ENV_PATCHED )) || return 0
   [ -f "$CODEX_ENV_STATE" ] || return 0
-  if /usr/bin/python3 - "$CODEX_ENV_FILE" "$CODEX_ENV_STATE" <<'PY'
+  if "$PY" - "$CODEX_ENV_FILE" "$CODEX_ENV_STATE" <<'PY'
 import json, os, re, sys, tempfile
 env_path, state_path = sys.argv[1:3]
 with open(state_path, encoding="utf-8") as f:
@@ -478,9 +483,14 @@ phase 1 PREFLIGHT "checking environment and app bundles"
 
 [ "$(uname -s)" = "Darwin" ] || die "macOS only."
 
-for cmd in pfctl curl ifconfig sudo awk python3 nc ps osascript; do
+for cmd in pfctl curl ifconfig sudo awk nc ps osascript; do
   command -v "$cmd" >/dev/null 2>&1 || die "Required command '$cmd' not found."
 done
+# python3 is checked separately and by RUNNING it, not by command -v. The system
+# copy is an xcrun stub that answers "yes, I exist" and then fails on every
+# call, which is how a machine with no Command Line Tools got all the way to
+# phase 2 before stalling with an unexplained "SOCKS not available".
+[ "$TUNNEL_PY_OK" -eq 1 ] || die "No working python3. Install the Command Line Tools: xcode-select --install"
 [ -x /usr/sbin/dseditgroup ] || die "dseditgroup not found."
 [ -x /usr/bin/dscl ] || die "dscl not found."
 
@@ -495,7 +505,7 @@ fi
 # "already running?" test; the second run then tore down the first run's
 # firewall rules and reported the first run's app as "not in the isolation
 # group", because it was comparing against its OWN gid.
-lock_result="$(/usr/bin/python3 -c '
+lock_result="$("$PY" -c '
 import json, os, sys
 path, mypid = sys.argv[1], int(sys.argv[2])
 def claim():
@@ -528,7 +538,7 @@ APP_EXECS=()
 APP_NAMES=()
 for app in ${APP_PATHS[@]+"${APP_PATHS[@]}"}; do
   [ -d "$app" ] || die "App bundle not found: $app"
-  meta="$(/usr/bin/python3 -c 'import plistlib,sys
+  meta="$("$PY" -c 'import plistlib,sys
 with open(sys.argv[1],"rb") as f: d=plistlib.load(f)
 print(d.get("CFBundleExecutable",""))' "$app/Contents/Info.plist" 2>/dev/null || true)"
   [ -n "$meta" ] || die "CFBundleExecutable missing in $app/Contents/Info.plist"
@@ -543,7 +553,7 @@ done
 # inside a tunnelled app terminates the session running the test.
 GUARD_FILE="$STATE_DIR/protected.json"
 if [ -f "$GUARD_FILE" ]; then
-  PROTECTED_BUNDLE="$(/usr/bin/python3 -c '
+  PROTECTED_BUNDLE="$("$PY" -c '
 import json,sys
 try: print(json.load(open(sys.argv[1])).get("host_bundle") or "")
 except Exception: pass' "$GUARD_FILE" 2>/dev/null)"
@@ -615,7 +625,7 @@ fi
 # Probe the advertised endpoint, then a couple of common fallbacks, so a stale
 # or missing system setting is not fatal on its own.
 socks_open() {
-  /usr/bin/python3 -c '
+  "$PY" -c '
 import socket, sys
 s = socket.socket(); s.settimeout(2)
 try: s.connect((sys.argv[1], int(sys.argv[2]))); sys.exit(0)
@@ -815,7 +825,7 @@ with Server(("127.0.0.1", 0), Handler) as srv:
 PYBRIDGE
 chmod 700 "$BRIDGE_SCRIPT"
 
-/usr/bin/python3 "$BRIDGE_SCRIPT" --socks-host "$SOCKS_HOST" --socks-port "$SOCKS_PORT" \
+"$PY" "$BRIDGE_SCRIPT" --socks-host "$SOCKS_HOST" --socks-port "$SOCKS_PORT" \
   --port-file "$BRIDGE_PORT_FILE" >"$BRIDGE_LOG" 2>&1 &
 BRIDGE_PID=$!
 
@@ -970,7 +980,7 @@ chmod 644 "$PROBE"
 # --------------------------------------------------------------- phase 7 ---
 phase 7 CALIBRATE "proving the leak test can actually detect egress"
 
-control="$(/usr/bin/python3 "$PROBE" 2>/dev/null || echo 0)"
+control="$("$PY" "$PROBE" 2>/dev/null || echo 0)"
 if [ "${control:-0}" -eq 0 ]; then
   die "Calibration failed: even an UNGUARDED process cannot reach any test target, so a 'blocked' result would be meaningless. Check your Internet connection and rerun. (This is the false-PASS bug from the old script.)"
 fi
@@ -981,7 +991,7 @@ phase 8 LEAKTEST "confirming the guarded group has no direct egress"
 
 leaked="$(restricted /usr/bin/env HTTP_PROXY= HTTPS_PROXY= ALL_PROXY= NO_PROXY='*' \
   http_proxy= https_proxy= all_proxy= no_proxy='*' \
-  /usr/bin/python3 "$PROBE" 2>/dev/null || echo 0)"
+  "$PY" "$PROBE" 2>/dev/null || echo 0)"
 [ "${leaked:-0}" -eq 0 ] \
   || die "UNSAFE: guarded process reached $leaked/5 targets directly. PF is not enforcing; refusing to claim protection."
 phase_ok "0/5 targets reachable directly - guard is enforcing"
@@ -1032,7 +1042,7 @@ fi
 
 if wants_app Claude; then
   mkdir -p "$HOME/.claude"
-  /usr/bin/python3 - "$SETTINGS_FILE" "$SETTINGS_STATE" "$HTTP_PROXY_URL" <<'PY' || die "Could not patch settings.json"
+  "$PY" - "$SETTINGS_FILE" "$SETTINGS_STATE" "$HTTP_PROXY_URL" <<'PY' || die "Could not patch settings.json"
 import json, os, sys, tempfile
 settings_path, state_path, proxy = sys.argv[1:4]
 keys = {"HTTP_PROXY": proxy, "HTTPS_PROXY": proxy, "http_proxy": proxy, "https_proxy": proxy,
@@ -1066,7 +1076,7 @@ fi
 
 if wants_app ChatGPT || wants_app Codex; then
   mkdir -p "$HOME/.codex"
-  /usr/bin/python3 - "$CODEX_ENV_FILE" "$CODEX_ENV_STATE" "$HTTP_PROXY_URL" <<'PY' || die "Could not patch ~/.codex/.env"
+  "$PY" - "$CODEX_ENV_FILE" "$CODEX_ENV_STATE" "$HTTP_PROXY_URL" <<'PY' || die "Could not patch ~/.codex/.env"
 import json, os, re, sys, tempfile
 env_path, state_path, proxy = sys.argv[1:4]
 values = {"HTTP_PROXY": proxy, "HTTPS_PROXY": proxy, "http_proxy": proxy, "https_proxy": proxy,
@@ -1106,7 +1116,7 @@ phase_ok "tunnel path verified at $PROTECTED_IP"
 # -------------------------------------------------------------- phase 10 ---
 phase 10 LAUNCH "starting protected app(s)"
 
-/usr/bin/python3 -c 'import json,sys
+"$PY" -c 'import json,sys
 json.dump({"pid":int(sys.argv[1]),"gid":int(sys.argv[2]),"group":sys.argv[3],
            "anchor":sys.argv[4],"proxy":sys.argv[5],"exit_ip":sys.argv[6],
            "apps":sys.argv[7:]}, open("'"$STATE_FILE"'","w"))' \
@@ -1205,7 +1215,7 @@ join_app() {
   local bundle="$1" exe name pid gid i left
   [ -d "$bundle" ] || { emit 13 JOIN fail "not an app bundle: $bundle"; return 1; }
   name="$(basename "$bundle" .app)"
-  exe="$bundle/Contents/MacOS/$(/usr/bin/python3 -c '
+  exe="$bundle/Contents/MacOS/$("$PY" -c '
 import plistlib,sys
 with open(sys.argv[1],"rb") as f: print(plistlib.load(f).get("CFBundleExecutable",""))
 ' "$bundle/Contents/Info.plist" 2>/dev/null)"

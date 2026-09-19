@@ -25,6 +25,11 @@
 
 set -uo pipefail
 
+# The system python3 at /usr/bin is a Command Line Tools stub: it exists and is
+# executable even when the Tools are not installed, and then every call dies
+# with "invalid active developer path". This resolves one that actually runs.
+. "$(cd "$(dirname "$0")" && pwd)/tunnel-python.sh"
+
 BIN="$(cd "$(dirname "$0")" && pwd)"
 APP="/Applications/Claude.app"
 RELAUNCH=1
@@ -110,7 +115,7 @@ for f in "$LOGIN_HOME/.claude/settings.json" "$LOGIN_HOME/.codex/.env"; do
   [ -f "$f" ] || continue
   case "$f" in
     *settings.json)
-      /usr/bin/python3 - "$f" <<'PY' && act "cleaned $(basename "$f")"
+      "$PY" - "$f" <<'PY' && act "cleaned $(basename "$f")"
 import json, shutil, sys
 p = sys.argv[1]
 try: d = json.load(open(p))
@@ -126,7 +131,7 @@ if before != len(e):
 PY
       ;;
     *.env)
-      /usr/bin/python3 - "$f" <<'PY' && act "cleaned $(basename "$f")"
+      "$PY" - "$f" <<'PY' && act "cleaned $(basename "$f")"
 import re, shutil, sys
 p = sys.argv[1]
 keys = {"HTTP_PROXY","HTTPS_PROXY","http_proxy","https_proxy","NO_PROXY","no_proxy","ALL_PROXY","all_proxy"}
@@ -167,7 +172,7 @@ ok "$NAME is down"
 # probe from inside a guarded group hangs — precisely when this tool is needed.
 # Python enforces a hard timeout.
 tcp_probe() {  # tcp_probe HOST PORT [SECONDS]
-  /usr/bin/python3 -c '
+  "$PY" -c '
 import socket, sys
 s = socket.socket(); s.settimeout(float(sys.argv[3]) if len(sys.argv) > 3 else 2.0)
 try:

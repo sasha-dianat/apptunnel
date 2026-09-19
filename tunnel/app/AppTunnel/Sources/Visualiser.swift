@@ -106,7 +106,7 @@ final class Visualiser: NSView {
 
         // The figure changes form with how hard the tunnel is working:
         // throughput turns it, latency ripples its outline. Idle means still.
-        let flow = live ? max(0, CGFloat(tel.values[6])) : 0
+        let flow = CGFloat(Model.shared.net.level)
         let rtt  = live ? max(0, CGFloat(tel.values[5])) : 0
         spin   += 0.002 + flow * 0.05
         ripple += 0.04 + rtt * 0.10
@@ -155,80 +155,118 @@ final class Visualiser: NSView {
         let tel = Model.shared.telemetry
         let w = bounds.width, h = bounds.height
 
-        let flow  = live ? max(0, CGFloat(tel.values[6])) : 0.08
-        let score = live ? CGFloat(max(0, tel.score))     : 0.30
+        // Real measured bandwidth, not a connection count.
+        let flow  = CGFloat(Model.shared.net.level)
+        let score = live ? CGFloat(max(0, tel.score)) : 0.55
 
-        // Smooth the ten discrete bands into a continuous surface.
-        func surface(_ u: CGFloat) -> (CGFloat, NSColor) {
+        func bandValue(_ k: Int) -> CGFloat {
+            let v = live ? tel.values[k] : 0.62
+            return v < 0 ? 0.35 : CGFloat(v)
+        }
+        func bandColour(_ k: Int) -> NSColor {
+            let v = live ? tel.values[k] : 0.62
+            if v < 0 { return NSColor(white: 0.45, alpha: 1) }
+            if v > 0.66 { return NSColor(srgbRed: 1.00, green: 0.90, blue: 0.35, alpha: 1) }
+            if v > 0.33 { return Skin.amber }
+            return Skin.red
+        }
+        func surface(_ u: CGFloat) -> CGFloat {
             let n = CGFloat(BANDS.count)
             let pos = min(max(u * (n - 1), 0), n - 1)
             let i0 = Int(pos), i1 = min(i0 + 1, BANDS.count - 1)
-            let f = pos - CGFloat(i0)
-            func val(_ k: Int) -> CGFloat {
-                let v = live ? tel.values[k] : 0.55
-                return v < 0 ? 0.35 : CGFloat(v)
-            }
-            // cosine interpolation keeps the surface smooth, not faceted
-            let t2 = (1 - cos(f * .pi)) / 2
-            let v = val(i0) * (1 - t2) + val(i1) * t2
-            let dominant = f < 0.5 ? i0 : i1
-            let dv = live ? tel.values[dominant] : 0.55
-            let c: NSColor = !live ? NSColor(srgbRed: 0.15, green: 0.55, blue: 0.30, alpha: 1)
-                : dv < 0 ? NSColor(white: 0.40, alpha: 1)
-                : dv > 0.66 ? NSColor(srgbRed: 1.00, green: 0.85, blue: 0.25, alpha: 1)   // gold crest
-                : dv > 0.33 ? Skin.amber
-                : Skin.red
-            return (v, c)
+            let f = (1 - cos((pos - CGFloat(i0)) * .pi)) / 2
+            return bandValue(i0) * (1 - f) + bandValue(i1) * f
         }
+
+        // A standby panel should look asleep, not broken. Off state gets its own
+        // cool palette and a faint wash so the unit still reads as a display
+        // rather than a black hole; green is reserved for "protected".
+        let wash = NSGradient(colors: live
+            ? [NSColor(srgbRed: 0.02, green: 0.09, blue: 0.05, alpha: 1), Skin.lcd]
+            : [NSColor(srgbRed: 0.04, green: 0.08, blue: 0.14, alpha: 1), Skin.lcd])
+        wash?.draw(in: bounds, angle: -90)
 
         guard let ctx = NSGraphicsContext.current else { return }
         ctx.saveGraphicsState()
         ctx.compositingOperation = .plusLighter
 
-        let lines = 10 + Int(flow * 8)          // the field thickens under load
+        let lines = live ? 9 + Int(flow * 9) : 7
         let step: CGFloat = 3
+        let emerald = live
+            ? NSColor(srgbRed: 0.10, green: 0.95, blue: 0.45, alpha: 1)
+            : NSColor(srgbRed: 0.25, green: 0.65, blue: 1.00, alpha: 1)   // standby blue
+
         for k in 0..<lines {
             let kf = CGFloat(k) / CGFloat(max(lines - 1, 1))
-            let depth = 0.35 + 0.65 * kf         // farther lines are dimmer
-            let lift = kf * h * 0.34             // stacked to suggest a surface
-            let phase = t * (0.010 + flow * 0.055) - kf * 1.5
+            let depth = 0.30 + 0.70 * kf
+            let lift = kf * h * 0.32
+            let phase = (live ? t * (0.008 + flow * 0.075) : t * 0.006) - kf * 1.6
 
-            var prev: NSPoint? = nil
+            // one path per line, so the halo can be stroked in wide passes
+            let path = NSBezierPath()
+            path.lineCapStyle = .round
+            path.lineJoinStyle = .round
             var x: CGFloat = 0
             while x <= w {
                 let u = x / w
-                let (v, c) = surface(u)
-                let swell = sin(u * .pi * 2.1 + phase) * (0.06 + 0.10 * flow) * h
-                let y = 3 + lift + v * (h * 0.42) + swell
-                let p = NSPoint(x: x, y: min(h - 1, y))
-                if let q = prev {
-                    let seg = NSBezierPath()
-                    seg.lineCapStyle = .round
-                    seg.move(to: q); seg.line(to: p)
-                    // deep green body with a gold-tinted crest
-                    let base = NSColor(srgbRed: 0.05, green: 0.75, blue: 0.35, alpha: 1)
-                    let mixT = min(1, max(0, (y / h - 0.35) * 1.9))
-                    let col = base.blended(withFraction: mixT * 0.9, of: c) ?? c
-                    for (lw, a) in [(3.2, 0.05), (1.8, 0.10), (0.9, 0.30)] {
-                        col.withAlphaComponent(CGFloat(a) * depth).setStroke()
-                        seg.lineWidth = CGFloat(lw)
-                        seg.stroke()
-                    }
-                }
-                prev = p
+                let swell = sin(u * .pi * 2.1 + phase) * (0.05 + 0.13 * flow) * h
+                let y = min(h - 1, 3 + lift + surface(u) * (h * 0.40) + swell)
+                x == 0 ? path.move(to: NSPoint(x: x, y: y)) : path.line(to: NSPoint(x: x, y: y))
                 x += step
+            }
+
+            // HALO: wide, faint passes first. This is what was missing - three
+            // thin strokes at 5% alpha read as a hairline, not a glow.
+            let boost: CGFloat = live ? (0.75 + 0.45 * flow) : 1.15
+            for (lw, a) in [(11.0, 0.030), (7.0, 0.045), (4.0, 0.075), (2.4, 0.130)] {
+                emerald.withAlphaComponent(CGFloat(a) * depth * boost).setStroke()
+                path.lineWidth = CGFloat(lw)
+                path.stroke()
+            }
+
+            // CORE: bright, thin, and tinted per band so the crest still says
+            // which factor sits under it.
+            var cx: CGFloat = 0
+            while cx < w {
+                let u = cx / w
+                let k2 = min(BANDS.count - 1, Int(u * CGFloat(BANDS.count)))
+                let seg = NSBezierPath()
+                seg.lineCapStyle = .round
+                var first = true
+                var sx = cx
+                let end = min(w, cx + w / CGFloat(BANDS.count))
+                while sx <= end {
+                    let uu = sx / w
+                    let swell = sin(uu * .pi * 2.1 + phase) * (0.05 + 0.13 * flow) * h
+                    let y = min(h - 1, 3 + lift + surface(uu) * (h * 0.40) + swell)
+                    let p = NSPoint(x: sx, y: y)
+                    first ? seg.move(to: p) : seg.line(to: p)
+                    first = false
+                    sx += step
+                }
+                let core = live ? bandColour(k2)
+                                : NSColor(srgbRed: 0.55, green: 0.85, blue: 1.0, alpha: 1)
+                core.withAlphaComponent(0.55 * depth + (live ? 0.35 : 0.22)).setStroke()
+                seg.lineWidth = 1.1
+                seg.stroke()
+                cx = end
             }
         }
         ctx.restoreGraphicsState()
 
-        // The pretty view still reports the number that matters.
-        let sc: NSColor = !live ? NSColor(white: 0.28, alpha: 1)
+        if !live {
+            let f = Skin.mono(6)
+            let msg = "STANDBY"
+            text(msg, NSPoint(x: w - width(msg, f) - 4, y: h - 9), f,
+                 NSColor(srgbRed: 0.40, green: 0.65, blue: 0.90, alpha: 1))
+        }
+        let sc: NSColor = !live ? NSColor(srgbRed: 0.20, green: 0.40, blue: 0.62, alpha: 1)
                         : score <= 0.001 ? Skin.red
                         : score > 0.8 ? Skin.green : Skin.amber
         NSColor(white: 0.09, alpha: 1).setFill()
         NSRect(x: 0, y: 0, width: w, height: 2).fill()
         sc.setFill()
-        NSRect(x: 0, y: 0, width: w * (live ? score : 0), height: 2).fill()
+        NSRect(x: 0, y: 0, width: w * (live ? score : 0.18), height: 2).fill()
     }
 
     /// An electric spectrum analyser where BOTH axes carry meaning.
@@ -245,7 +283,7 @@ final class Visualiser: NSView {
         let base = strip + 2
         let h = top - base
         let slot = bounds.width / CGFloat(BANDS.count)
-        let flow = max(0, CGFloat(tel.values[6]))
+        let flow = CGFloat(Model.shared.net.level)
         var tops: [NSPoint] = []
 
         for i in 0..<BANDS.count {
@@ -307,7 +345,7 @@ final class Visualiser: NSView {
         let cx = bounds.midX, cy = bounds.midY
         let rMax = min(bounds.width, bounds.height) / 2 - 5
         let n = BANDS.count
-        let flow = live ? max(0, CGFloat(tel.values[6])) : 0
+        let flow = CGFloat(Model.shared.net.level)
 
         func point(_ i: Int, _ frac: CGFloat, _ wobble: CGFloat = 0) -> NSPoint {
             let a = -CGFloat.pi / 2 + CGFloat(i) * 2 * CGFloat.pi / CGFloat(n) + spin
