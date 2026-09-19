@@ -372,12 +372,12 @@ cleanup() {
   trap - EXIT INT TERM HUP
   emit 98 TEARDOWN run "restoring system state"
 
-  local pid
-  for pid in ${APP_WRAPPER_PIDS[@]+"${APP_WRAPPER_PIDS[@]}"}; do
-    if kill -0 "$pid" 2>/dev/null; then
-      kill -TERM "$pid" 2>/dev/null || true
-    fi
-  done
+  # Deliberately does NOT signal the tunnelled apps. Dropping PF and the bridge
+  # already denies them the network, which is the property the guard exists to
+  # provide. Killing them as well destroyed live Claude/Codex sessions on every
+  # transient failure, and is what forced a relaunch after each reconnect. The
+  # apps stay up, keep their gid, and re-adopt the tunnel when it returns.
+  # tunnel-quit.sh is the one path that closes them, on purpose.
 
   restore_settings
   restore_codex_env
@@ -401,11 +401,10 @@ cleanup() {
     fi
   fi
 
-  if (( GROUP_CREATED )); then
-    sudo -n /usr/sbin/dseditgroup -o edit -d "$LOGIN_USER" -t user "$GROUP_NAME" >/dev/null 2>&1 || true
-    sudo -n /usr/sbin/dseditgroup -o delete "$GROUP_NAME" >/dev/null 2>&1 \
-      || note_problem "temporary group $GROUP_NAME not deleted. Run: sudo dseditgroup -o delete $GROUP_NAME"
-  fi
+  # The group is persistent: a surviving app is only still reachable on the next
+  # connect because its gid did not change. retire_orphaned_state deletes it at
+  # the next connect if no process is left in it, and tunnel-quit.sh deletes it
+  # after closing the apps.
 
   [ -n "$SUDO_KEEPALIVE_PID" ] && kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
   # Only ever remove the lock we ourselves claimed.
@@ -1377,8 +1376,10 @@ while any_alive; do
   done
   if [ "$bad" -gt 0 ]; then
     emit 12 ESCAPE fail "$bad process(es) left the isolation group - failing closed"
-    log "Failing closed: stopping protected app(s)."
-    for p in ${APP_WRAPPER_PIDS[@]+"${APP_WRAPPER_PIDS[@]}"}; do kill -TERM "$p" 2>/dev/null || true; done
+    # Exiting runs cleanup, which tears down PF and the bridge. That is what
+    # failing closed means here: the escaped process loses its route out. The
+    # apps are left running so the session survives and can re-adopt the tunnel.
+    log "Failing closed: dropping the network, apps left running."
     exit 70
   fi
 done

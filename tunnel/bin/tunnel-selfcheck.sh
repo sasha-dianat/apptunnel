@@ -173,6 +173,20 @@ grep -q 'BRIDGE_PORT="\${TUNNEL_BRIDGE_PORT:-17080}"' "$BIN/tunnel-lock.sh" \
   && pass "tunnel-lock.sh pins the bridge to a fixed port" \
   || fail "tunnel-lock.sh pins the bridge to a fixed port"
 
+# Teardown killed every tunnelled app on any exit, so one transient failure
+# destroyed live Claude/Codex sessions. Fail-closed must mean no network, not
+# no process.
+if awk '/^cleanup\(\)/,/^}/' "$BIN/tunnel-lock.sh" | grep -qE 'APP_(WRAPPER|MAIN)_PIDS'; then
+  fail "cleanup() does not signal tunnelled apps"
+else
+  pass "cleanup() does not signal tunnelled apps"
+fi
+if grep -q 'Failing closed: dropping the network, apps left running' "$BIN/tunnel-lock.sh"; then
+  pass "escape handler cuts the network without killing apps"
+else
+  fail "escape handler cuts the network without killing apps"
+fi
+
 # SUDO_USER can be inherited as "root" through a sudo chain, which made the
 # doctor abort after one line and show an almost-empty window.
 for f in tunnel-doctor.sh tunnel-freehost.sh tunnel-testkit.sh; do
