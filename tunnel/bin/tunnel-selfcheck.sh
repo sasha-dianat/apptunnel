@@ -201,6 +201,19 @@ else
   fail "join_app skips the quit for an app already in the group"
 fi
 
+# Stop leaves apps running so they can re-adopt; quitting AppTunnel is the one
+# action that closes them.
+if [ -x "$BIN/tunnel-quit.sh" ]; then
+  pass "tunnel-quit.sh exists and is executable"
+else
+  fail "tunnel-quit.sh exists and is executable"
+fi
+bash -n "$BIN/tunnel-quit.sh" 2>/dev/null \
+  && pass "tunnel-quit.sh parses" || fail "tunnel-quit.sh parses"
+grep -q 'tunnel-quit.sh' "$BIN/../gui/tunneld.py" \
+  && pass "the GUI closes tunnelled apps when it shuts down" \
+  || fail "the GUI closes tunnelled apps when it shuts down"
+
 # SUDO_USER can be inherited as "root" through a sudo chain, which made the
 # doctor abort after one line and show an almost-empty window.
 for f in tunnel-doctor.sh tunnel-freehost.sh tunnel-testkit.sh; do

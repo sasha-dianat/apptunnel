@@ -28,6 +28,7 @@ BIN = os.path.normpath(os.path.join(HERE, "..", "bin"))
 LOCK = os.path.join(BIN, "tunnel-lock.sh")
 DOCTOR = os.path.join(BIN, "tunnel-doctor.sh")
 REPAIR = os.path.join(BIN, "tunnel-veepn-repair.sh")
+QUIT = os.path.join(BIN, "tunnel-quit.sh")
 STATE_DIR = os.path.expanduser("~/.apptunnel")
 APPS_FILE = os.path.join(STATE_DIR, "apps.json")
 EVENTS = os.path.join(STATE_DIR, "events.jsonl")
@@ -349,7 +350,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     os.makedirs(STATE_DIR, exist_ok=True)
-    for p in (LOCK, DOCTOR, REPAIR):
+    for p in (LOCK, DOCTOR, REPAIR, QUIT):
         if os.path.isfile(p):
             os.chmod(p, 0o755)
     srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -361,7 +362,16 @@ def main():
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
-        print("\nGUI stopped. Any running tunnel session is unaffected.")
+        pass
+    finally:
+        # Quitting AppTunnel closes the apps it put inside the tunnel. Stop and
+        # an accidental disconnect deliberately do not: those leave the apps
+        # running with no network so they can re-adopt a rebuilt tunnel.
+        try:
+            subprocess.run([QUIT], timeout=90)
+        except Exception:
+            pass
+        print("\nGUI stopped; tunnelled apps closed.")
 
 
 if __name__ == "__main__":
