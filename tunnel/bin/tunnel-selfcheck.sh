@@ -187,6 +187,20 @@ else
   fail "escape handler cuts the network without killing apps"
 fi
 
+# A reconnect must adopt the processes that are already inside the group
+# instead of quitting and relaunching them.
+grep -q '^group_pids_for_exe()' "$BIN/tunnel-lock.sh" \
+  && pass "tunnel-lock.sh can find live members of the isolation group" \
+  || fail "tunnel-lock.sh can find live members of the isolation group"
+grep -q 'already inside the tunnel; adopting' "$BIN/tunnel-lock.sh" \
+  && pass "tunnel-lock.sh adopts a running app instead of relaunching it" \
+  || fail "tunnel-lock.sh adopts a running app instead of relaunching it"
+if awk '/^join_app\(\)/,/^}/' "$BIN/tunnel-lock.sh" | grep -q 'group_pids_for_exe'; then
+  pass "join_app skips the quit for an app already in the group"
+else
+  fail "join_app skips the quit for an app already in the group"
+fi
+
 # SUDO_USER can be inherited as "root" through a sudo chain, which made the
 # doctor abort after one line and show an almost-empty window.
 for f in tunnel-doctor.sh tunnel-freehost.sh tunnel-testkit.sh; do

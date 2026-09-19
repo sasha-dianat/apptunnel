@@ -1126,6 +1126,20 @@ PY
 fi
 phase_ok "tunnel path verified at $PROTECTED_IP"
 
+# PIDs of live processes that are already inside the isolation group AND are
+# running this executable. These are the apps that survived a disconnect: their
+# gid still matches and their baked-in HTTP_PROXY still points at the bridge
+# port, so the rebuilt tunnel is the one they were already using.
+#
+# Main-executable matches only, for the same reason main_pids_of does it: a bare
+# `grep -F "$exe"` matches the grep process itself, which made every check
+# report the app as running forever.
+group_pids_for_exe() {
+  ps -axo pid=,gid=,command= | awk -v g="$1" -v e="$2" '
+    {p=$1; gg=$2; $1=""; $2=""; sub(/^[ \t]+/,"");
+     if (gg==g && ($0==e || index($0, e " ")==1)) print p}'
+}
+
 # -------------------------------------------------------------- phase 10 ---
 phase 10 LAUNCH "starting protected app(s)"
 
@@ -1137,9 +1151,24 @@ json.dump({"pid":int(sys.argv[1]),"gid":int(sys.argv[2]),"group":sys.argv[3],
   ${APP_PATHS[@]+"${APP_PATHS[@]}"} 2>/dev/null || true
 if (( RUN_AS_ROOT )); then chown "$LOGIN_USER" "$STATE_FILE" 2>/dev/null || true; fi
 
+# Executables adopted rather than launched. Recorded because a freshly launched
+# app is also in the group moments later, so "is it in the group?" cannot by
+# itself tell the two apart in the verification pass below.
+ADOPTED_LIST=""
+
 idx=0
 for exe in ${APP_EXECS[@]+"${APP_EXECS[@]}"}; do
   name="${APP_NAMES[$idx]}"
+  # Survived the last disconnect: adopt it rather than quitting and relaunching.
+  adopted="$(group_pids_for_exe "$GROUP_GID" "$exe" | head -1)"
+  if [ -n "$adopted" ]; then
+    log "      $name already inside the tunnel; adopting pid $adopted"
+    APP_MAIN_PIDS+=("$adopted")
+    ADOPTED_LIST="$ADOPTED_LIST$exe
+"
+    idx=$((idx+1))
+    continue
+  fi
   set +e
   launch_app /usr/bin/env \
     HOME="$LOGIN_HOME" USER="$LOGIN_USER" LOGNAME="$LOGIN_USER" PATH="$ORIGINAL_PATH" \
@@ -1158,6 +1187,12 @@ sleep 5
 idx=0
 for exe in ${APP_EXECS[@]+"${APP_EXECS[@]}"}; do
   name="${APP_NAMES[$idx]}"
+  # Adopted apps were verified in-group when they were found and were never
+  # launched, so they have no stderr log to quote and must not be recorded twice.
+  if printf '%s' "$ADOPTED_LIST" | grep -Fxq "$exe"; then
+    idx=$((idx+1))
+    continue
+  fi
   pid="$(ps -axo pid=,command= | awk -v exe="$exe" '{p=$1;$1="";sub(/^[ \t]+/,"");if($0==exe||index($0,exe" ")==1)print p}' | head -1)"
   if [ -z "$pid" ]; then
     tail -40 "$TMPROOT/$name.stderr.log" >&2 || true
@@ -1236,6 +1271,16 @@ with open(sys.argv[1],"rb") as f: print(plistlib.load(f).get("CFBundleExecutable
 
   emit 13 JOIN run "adding $name to the running tunnel"
   log "Join request: $name"
+
+  # Already a member - it survived a disconnect, or was launched with the tunnel.
+  # Adopt it. Quitting here would destroy a live session to achieve nothing.
+  adopted="$(group_pids_for_exe "$GROUP_GID" "$exe" | head -1)"
+  if [ -n "$adopted" ]; then
+    APP_MAIN_PIDS+=("$adopted")
+    log "      $name already inside the tunnel; adopting pid $adopted"
+    emit 13 JOIN ok "$name already inside the tunnel; adopted pid $adopted"
+    return 0
+  fi
 
   # Quit only this app - and only if it is actually running.
   left="$(main_pids_of "$exe")"
