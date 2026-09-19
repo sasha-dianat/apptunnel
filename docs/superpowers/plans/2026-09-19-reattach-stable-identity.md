@@ -29,7 +29,7 @@
 **Interfaces:**
 - Produces: `GROUP_NAME=apptunnel`, `GROUP_GID=57000`, `ANCHOR=com.apple/apptunnel`, `BRIDGE_PORT` defaulting to `17080`. Tasks 3 and 4 rely on all four being constant across runs.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to `tunnel-selfcheck.sh`, after the existing `tunnel-connect.sh` ordering test:
 
@@ -49,12 +49,12 @@ grep -q 'BRIDGE_PORT="\${TUNNEL_BRIDGE_PORT:-17080}"' "$BIN/tunnel-lock.sh" \
   || fail "tunnel-lock.sh pins the bridge to a fixed port"
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `tunnel/bin/tunnel-selfcheck.sh --quick 2>&1 | grep -E "identity to|fixed port"`
 Expected: 4 FAIL lines.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 In `tunnel-lock.sh` replace line 60:
 
@@ -117,12 +117,12 @@ Pass it at the invocation (~828):
   --port "$BRIDGE_PORT" --port-file "$BRIDGE_PORT_FILE" >"$BRIDGE_LOG" 2>&1 &
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `tunnel/bin/tunnel-selfcheck.sh --quick 2>&1 | tail -4`
 Expected: 0 failed.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add tunnel/bin/tunnel-lock.sh tunnel/bin/tunnel-selfcheck.sh
@@ -141,7 +141,7 @@ git commit -m "feat(lock): pin tunnel identity so a rebuilt tunnel is the same t
 - Consumes: stable `GROUP_NAME` from Task 1.
 - Produces: teardown that leaves `APP_WRAPPER_PIDS` and `APP_MAIN_PIDS` running and leaves the group in place. Task 4 relies on the group surviving teardown.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```bash
 # Teardown killed every tunnelled app on any exit, so one transient failure
@@ -159,12 +159,12 @@ else
 fi
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `tunnel/bin/tunnel-selfcheck.sh --quick 2>&1 | grep -E "does not signal|without killing"`
 Expected: 2 FAIL lines.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 In `cleanup()`, delete the wrapper-kill loop entirely and replace with:
 
@@ -194,12 +194,12 @@ Replace the escape handler body (`if [ "$bad" -gt 0 ]`):
   fi
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `tunnel/bin/tunnel-selfcheck.sh --quick 2>&1 | tail -4`
 Expected: 0 failed.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add tunnel/bin/tunnel-lock.sh tunnel/bin/tunnel-selfcheck.sh
@@ -218,7 +218,7 @@ git commit -m "fix(lock): fail closed by cutting the network, not by killing ses
 - Consumes: stable `GROUP_GID` (Task 1), surviving processes (Task 2).
 - Produces: `group_pids_for_exe <exe>` printing PIDs of live group members running `<exe>`. Used by the launch loop and by `join_app`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```bash
 # A reconnect must adopt the processes that are already inside the group
@@ -236,12 +236,12 @@ else
 fi
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `tunnel/bin/tunnel-selfcheck.sh --quick 2>&1 | grep -E "live members|adopts a running|skips the quit"`
 Expected: 3 FAIL lines.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Add above the phase 10 launch loop:
 
@@ -285,12 +285,12 @@ In `join_app`, before the quit block:
   fi
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `tunnel/bin/tunnel-selfcheck.sh --quick 2>&1 | tail -4`
 Expected: 0 failed.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add tunnel/bin/tunnel-lock.sh tunnel/bin/tunnel-selfcheck.sh
@@ -310,7 +310,7 @@ git commit -m "feat(lock): adopt live group members instead of relaunching them"
 - Consumes: stable `GROUP_NAME`/`GROUP_GID` (Task 1), group surviving teardown (Task 2).
 - Produces: `tunnel-quit.sh`, exit 0 on success. Closes every live group member, then deletes the group.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```bash
 # Stop leaves apps running so they can re-adopt; quitting AppTunnel is the one
@@ -327,12 +327,12 @@ grep -q 'tunnel-quit.sh' "$HERE/../gui/tunneld.py" \
   || fail "the GUI closes tunnelled apps when it shuts down"
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `tunnel/bin/tunnel-selfcheck.sh --quick 2>&1 | grep -E "tunnel-quit|GUI closes"`
 Expected: 3 FAIL lines.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Create `tunnel/bin/tunnel-quit.sh`:
 
@@ -414,12 +414,12 @@ and replace the shutdown handler:
 
 Add `REPAIR`'s sibling to the chmod loop: `for p in (LOCK, DOCTOR, REPAIR, QUIT):`
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `tunnel/bin/tunnel-selfcheck.sh --quick 2>&1 | tail -4`
 Expected: 0 failed.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add tunnel/bin/tunnel-quit.sh tunnel/bin/tunnel-selfcheck.sh tunnel/gui/tunneld.py
