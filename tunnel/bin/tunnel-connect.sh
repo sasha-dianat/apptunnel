@@ -123,6 +123,11 @@ finally: s.close()
 
 if ! require_socks_endpoint; then
   stamp "no SOCKS5 endpoint reachable - nothing was stopped"
+  # The panel only learns the outcome from events.jsonl. Aborting here without
+  # writing one left it believing a connect was still in flight, and play
+  # refuses to start a second connect - so the button stayed dead for good.
+  printf '{"t": %s, "phase": 2, "name": "SOCKS", "status": "fail", "msg": "No VPN endpoint is up. Nothing was stopped. Press VPN START, then play."}\n' \
+    "$(date +%s)" >> "$LOGIN_HOME/.apptunnel/events.jsonl" 2>/dev/null || true
   cat >&2 <<MSG
 
 ERROR: No SOCKS5 listener found, so the tunnel was not started.

@@ -51,6 +51,24 @@ final class Model {
     var lastMessage = ""
     var sessionActive = false
     var connecting = false
+
+    /// Reconnect by itself when the tunnel drops. Persisted, so the choice
+    /// survives relaunching the app.
+    var autoReconnect: Bool {
+        get { UserDefaults.standard.bool(forKey: "autoReconnect") }
+        set { UserDefaults.standard.set(newValue, forKey: "autoReconnect") }
+    }
+    /// Set by the stop button, cleared by play. A drop the user asked for must
+    /// never be "repaired" behind their back.
+    var userStopped = false
+    /// When the launcher last wrote an event, and when a connect was handed to
+    /// it - together they reveal a connect that died without saying so.
+    var lastEventAt = Date.distantPast
+    var dispatchedAt: Date? = nil
+    /// Whether the system SOCKS proxy is switched ON. detectSocks used to keep
+    /// the last port when the proxy was turned off, so a disabled proxy still
+    /// looked like it pointed at the VPN.
+    var socksEnabled = false
     var exitIP = "---.---.---.---"
     var gid = "-----"
     var socksUp = false
@@ -151,6 +169,18 @@ final class Model {
                 startedAt = nil; exitIP = "---.---.---.---"; gid = "-----"
             }
         }
+        // A connect that dies before its first phase - no VPN endpoint, or a
+        // launcher killed outright - may write no failure event. `connecting`
+        // then never cleared, and since play refuses to start a second
+        // connect, the button stayed dead until the app was restarted.
+        if connecting, !sessionActive, let d = dispatchedAt,
+           Date().timeIntervalSince(max(d, lastEventAt)) > 45 {
+            connecting = false; dispatchedAt = nil
+            lastMessage = "connect ended without starting a tunnel - see the log"
+            dirty = true
+        }
+        if sessionActive { dispatchedAt = nil }
+
         let up = probeSocks()
         if up != socksUp { socksUp = up; dirty = true }
         let prot = readProtection()
@@ -225,13 +255,18 @@ final class Model {
             }
             return nil
         }
-        guard field("SOCKSEnable") == "1" else { return }
+        socksEnabled = field("SOCKSEnable") == "1"
+        guard socksEnabled else { return }
         if let h = field("SOCKSProxy"), !h.isEmpty { socksHost = h }
         if let s = field("SOCKSPort"), let v = UInt16(s) { socksPort = v }
     }
 
+    private var socksDetectTick = 0
     private func probeSocks() -> Bool {
-        detectSocks()
+        // scutil is a fork and the system proxy rarely changes, so it is
+        // re-read about every 5s instead of on every 0.4s poll.
+        if socksDetectTick % 12 == 0 { detectSocks() }
+        socksDetectTick += 1
         let s = socket(AF_INET, SOCK_STREAM, 0)
         guard s >= 0 else { return false }
         defer { close(s) }
@@ -253,6 +288,7 @@ final class Model {
         let lines = t.split(separator: "\n", omittingEmptySubsequences: true)
         if lines.count < cursor { cursor = 0; resetPhases() }
         guard lines.count > cursor else { return false }
+        lastEventAt = Date()
         for line in lines[cursor...] {
             guard let d = line.data(using: .utf8),
                   let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
@@ -792,6 +828,7 @@ final class Main: NSWindow {
     let hint = NSTextField(labelWithString: "")
     private var logWindows: [LogWindow] = []
     private var busy = false
+    private let autoBox = NSButton(checkboxWithTitle: "AUTO-RECONNECT", target: nil, action: nil)
 
     init() {
         // 662, not 556: the button row is laid out left to right and already
@@ -817,6 +854,7 @@ final class Main: NSWindow {
                 object: self, queue: .main) { [weak self] _ in self?.retimeAnimation() }
             Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in
                 if Model.shared.poll() { self?.refresh() }
+                self?.autoReconnectTick()
             }
         }
     }
@@ -954,6 +992,15 @@ final class Main: NSWindow {
         l1.frame = NSRect(x: 10, y: y, width: 220, height: 14)
         root.addSubview(l1)
 
+        autoBox.attributedTitle = NSAttributedString(string: "AUTO-RECONNECT",
+            attributes: [.font: Skin.mono(9, true), .foregroundColor: Skin.label])
+        autoBox.frame = NSRect(x: W - 142, y: y - 2, width: 134, height: 18)
+        autoBox.state = Model.shared.autoReconnect ? .on : .off
+        autoBox.target = self
+        autoBox.action = #selector(toggleAutoReconnect)
+        autoBox.toolTip = "Reconnect by itself when the tunnel drops (the amber bar). Tunnelled apps are never closed; they are re-attached to the new tunnel. If VeePN's endpoint was the one in use and it died, it is restarted first. Rebuilding the tunnel needs administrator rights, so macOS may ask for your password unless you authorised within the last few minutes."
+        root.addSubview(autoBox)
+
         y -= 116
         bars.frame = NSRect(x: 8, y: y, width: W - 16, height: 112)
         root.addSubview(bars)
@@ -1056,25 +1103,42 @@ final class Main: NSWindow {
         }
     }
 
-    func connect() {
+    /// `auto` is set by the reconnect scheduler. An automatic connect must not
+    /// block on a modal dialog nobody is there to answer, so every question it
+    /// would ask is answered with the non-destructive choice instead.
+    func connect(auto: Bool = false) {
         let m = Model.shared
-        if m.sessionActive { warn("A tunnel is already running.", "Press the stop button first."); return }
+        if !auto { reconnectPaused = false; reconnectAttempts = 0; reconnectAt = nil }
+        if m.sessionActive {
+            if !auto { warn("A tunnel is already running.", "Press the stop button first.") }
+            return
+        }
         // A connect runs detached, so the button stays live while it works.
         // Pressing it again started a SECOND tunnel-connect.sh: the two raced,
         // each truncating and rewriting events.jsonl, and the phase display
         // showed whichever won - phases appearing, vanishing and repeating.
         if m.connecting {
-            warn("Already connecting.", "Wait for the current attempt to finish or fail.")
+            if !auto { warn("Already connecting.", "Wait for the current attempt to finish or fail.") }
             return
         }
         var apps = m.enabledApps
-        guard !apps.isEmpty else { warn("Nothing to launch.", "Tick at least one app in the roster."); return }
+        guard !apps.isEmpty else {
+            if !auto { warn("Nothing to launch.", "Tick at least one app in the roster.") }
+            return
+        }
 
         // Test protection skips the host app. If that leaves nothing, the
         // launcher would abort at PREFLIGHT with a message the user never sees.
         if let host = m.protectedHost {
             let remaining = apps.filter { $0.path != host }
-            if remaining.isEmpty {
+            if auto {
+                // Leave the protected host out; never switch protection off.
+                guard !remaining.isEmpty else {
+                    m.lastMessage = "auto-reconnect: only the protected host is ticked"
+                    refresh(); return
+                }
+                apps = remaining
+            } else if remaining.isEmpty {
                 let a = NSAlert()
                 a.messageText = "Test protection is on."
                 a.informativeText = """
@@ -1099,6 +1163,7 @@ final class Main: NSWindow {
             }
         }
         if !m.socksUp {
+            if auto { return }   // the scheduler restores the upstream first
             let a = NSAlert()
             a.messageText = "No SOCKS5 proxy on \(m.socksHost):\(m.socksPort)"
             a.informativeText = "Connect VeePN using Shadowsocks first. Start anyway?"
@@ -1108,6 +1173,7 @@ final class Main: NSWindow {
         try? "".write(toFile: m.eventsFile, atomically: true, encoding: .utf8)
         try? FileManager.default.removeItem(atPath: m.stopFile)
         m.resetPhases(); m.demoMode = false; m.connecting = true
+        m.userStopped = false
         m.startedAt = Date(); m.lastMessage = "authorising…"
         refresh()
 
@@ -1116,17 +1182,108 @@ final class Main: NSWindow {
         for a in apps { cmd += " --app " + Runner.q(a.path) }
         cmd += " --yes"
         let log = m.logFile
-        withBusy("authorising…", { Runner.adminDetached(cmd, log: log) }) { ok, out in
+        withBusy(auto ? "reconnecting - authorising…" : "authorising…",
+                 { Runner.adminDetached(cmd, log: log) }) { ok, out in
             if !ok {
                 m.connecting = false
-                m.lastMessage = out.contains("-128") ? "cancelled" : "could not start: \(out)"
+                let cancelled = out.contains("-128")
+                if cancelled && auto {
+                    // The password prompt was dismissed. Re-asking on a timer
+                    // would be a prompt storm, so automatic retries stop until
+                    // play is pressed or the box is re-ticked.
+                    self.reconnectPaused = true
+                    m.lastMessage = "auto-reconnect paused: authorisation was cancelled"
+                } else {
+                    m.lastMessage = cancelled ? "cancelled" : "could not start: \(out)"
+                }
                 self.refresh()
-                if !out.contains("-128") { self.showLog("LAUNCH FAILED", out) }
+                if !cancelled && !auto { self.showLog("LAUNCH FAILED", out) }
             } else {
+                m.dispatchedAt = Date()
                 m.lastMessage = "launcher running in the background…"
                 self.refresh()
             }
         }
+    }
+
+    // MARK: auto-reconnect
+
+    private var wasActive = false          // a session has been seen, so a drop is a drop
+    private var reconnectAt: Date? = nil
+    private var reconnectAttempts = 0
+    private var reconnectPaused = false
+    private var lastUpstreamRepair = Date.distantPast
+    private let reconnectBackoff: [TimeInterval] = [10, 20, 40, 60, 120]
+    private let reconnectMax = 8
+
+    @objc func toggleAutoReconnect() {
+        let m = Model.shared
+        m.autoReconnect = autoBox.state == .on
+        reconnectAt = nil; reconnectAttempts = 0; reconnectPaused = false
+        m.lastMessage = m.autoReconnect ? "auto-reconnect on" : "auto-reconnect off"
+        refresh()
+    }
+
+    /// The VeePN endpoint this app manages is the one the system proxy is
+    /// switched ON and pointed at, and nothing is serving it. Only then is
+    /// restarting it restoring the user's choice; if they turned the proxy off
+    /// or pointed it at another provider, it is left alone - otherwise this
+    /// would resurrect a VPN exit they had deliberately left.
+    private func ourUpstreamIsDead() -> Bool {
+        let m = Model.shared
+        return m.socksEnabled && m.socksPort == 1081 && !m.socksUp
+    }
+
+    private func repairUpstream() {
+        lastUpstreamRepair = Date()
+        let cmd = Runner.q(script("tunnel-veepn-repair.sh")) + " 2>&1"
+        withBusy("restoring the VPN endpoint…", { Runner.user(cmd) }) { ok, _ in
+            Model.shared.pollVeePN()
+            Model.shared.lastMessage = ok ? "VPN endpoint restored"
+                : "VPN endpoint could not be restored - open VeePN, press Connect once, then VPN START"
+            self.refresh()
+        }
+    }
+
+    /// Runs on every poll. Cheap when there is nothing to do.
+    func autoReconnectTick() {
+        let m = Model.shared
+        if m.sessionActive {
+            wasActive = true; reconnectAt = nil; reconnectAttempts = 0
+            // The launcher is alive but its upstream died: traffic goes nowhere
+            // although nothing looks disconnected. Restarting the endpoint needs
+            // no password, so this repair is silent.
+            if m.autoReconnect, ourUpstreamIsDead(), !busy,
+               Date().timeIntervalSince(lastUpstreamRepair) > 30 {
+                repairUpstream()
+            }
+            return
+        }
+        guard m.autoReconnect, wasActive, !m.userStopped, !reconnectPaused,
+              !m.connecting, !busy else { return }
+
+        let now = Date()
+        guard let due = reconnectAt else {
+            reconnectAt = now.addingTimeInterval(3)    // ride out a momentary flap
+            m.lastMessage = "tunnel dropped - reconnecting automatically…"
+            refresh(); return
+        }
+        guard now >= due else { return }
+        if reconnectAttempts >= reconnectMax {
+            wasActive = false; reconnectAt = nil
+            m.lastMessage = "auto-reconnect gave up after \(reconnectMax) attempts - press play"
+            refresh(); return
+        }
+        reconnectAttempts += 1
+        reconnectAt = now.addingTimeInterval(
+            reconnectBackoff[min(reconnectAttempts - 1, reconnectBackoff.count - 1)])
+
+        if ourUpstreamIsDead() { repairUpstream(); return }
+        if !m.socksUp {
+            m.lastMessage = "tunnel dropped and no VPN endpoint is up - waiting (attempt \(reconnectAttempts))"
+            refresh(); return
+        }
+        connect(auto: true)
     }
 
     func disconnect() {
@@ -1134,6 +1291,7 @@ final class Main: NSWindow {
         guard m.sessionActive || m.connecting else {
             warn("No running session.", "Nothing to disconnect."); return
         }
+        m.userStopped = true
         // The launcher is root-owned, so we ask it to stop via a flag file it polls.
         //
         // The file carries provenance rather than being empty. "The tunnel
@@ -1412,6 +1570,26 @@ final class Main: NSWindow {
 
 final class Delegate: NSObject, NSApplicationDelegate {
     var win: Main?
+
+    /// Quitting AppTunnel is the ONE action that closes the tunnelled apps.
+    /// Stop and every kind of disconnect leave them running. Because this does
+    /// close live sessions, it names them first and can be cancelled.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        let quit = Model.shared.binDir + "/tunnel-quit.sh"
+        guard FileManager.default.isExecutableFile(atPath: quit) else { return .terminateNow }
+        let names = Runner.user(Runner.q(quit) + " --list").out
+            .split(separator: "\n").map(String.init).filter { !$0.isEmpty }
+        guard !names.isEmpty else { return .terminateNow }
+        let a = NSAlert()
+        a.messageText = "Quit AppTunnel and close the tunnelled apps?"
+        a.informativeText = "\(names.joined(separator: ", ")) will be asked to quit, so they can "
+                          + "save their state. Stop, by contrast, leaves them running."
+        a.addButton(withTitle: "Quit and close them")
+        a.addButton(withTitle: "Cancel")
+        guard a.runModal() == .alertFirstButtonReturn else { return .terminateCancel }
+        _ = Runner.user(Runner.q(quit) + " 2>&1")
+        return .terminateNow
+    }
 
     func applicationDidFinishLaunching(_ n: Notification) {
         // Before anything that can show an alert: without a main menu there are

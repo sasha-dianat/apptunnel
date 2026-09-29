@@ -345,7 +345,7 @@ grep -q 'http_to_socks' "$BIN/tunnel-connect.sh" 2>/dev/null \
   && pass "connect retires orphaned bridges before binding the fixed port" \
   || fail "connect retires orphaned bridges before binding the fixed port"
 # Connect runs detached; a second press raced the first and scrambled the phases.
-if awk '/func connect\(\)/,/^    }/' "$SRC" 2>/dev/null | grep -q 'if m.connecting {'; then
+if awk '/func connect\(/,/^    }/' "$SRC" 2>/dev/null | grep -q 'if m.connecting {'; then
   pass "a second press while connecting is refused, not raced"
 else
   fail "a second press while connecting is refused, not raced"
@@ -361,6 +361,52 @@ if awk '/func pollVeePN/,/^    }/' "$SRC" 2>/dev/null | grep -q 'Darwin.connect'
 else
   fail "the VPN toggle reads the live endpoint, not a state file"
 fi
+
+# ---- auto-reconnect and the connect-lifecycle sweep ------------------------
+grep -q 'forKey: "autoReconnect"' "$SRC" \
+  && pass "auto-reconnect is a persisted setting" || fail "auto-reconnect is a persisted setting"
+grep -q 'NSButton(checkboxWithTitle: "AUTO-RECONNECT"' "$SRC" \
+  && pass "the panel has an AUTO-RECONNECT checkbox" || fail "the panel has an AUTO-RECONNECT checkbox"
+grep -q 'self?.autoReconnectTick()' "$SRC" \
+  && pass "the poll loop drives the reconnect scheduler" || fail "the poll loop drives the reconnect scheduler"
+# A deliberate stop must never be repaired behind the user's back.
+awk '/func disconnect\(\)/,/^    }/' "$SRC" | grep -q 'm.userStopped = true' \
+  && pass "stop marks the drop as deliberate, so it is not auto-reconnected" \
+  || fail "stop marks the drop as deliberate, so it is not auto-reconnected"
+awk '/func autoReconnectTick/,/^    }/' "$SRC" | grep -q '!m.userStopped' \
+  && pass "the scheduler honours a deliberate stop" || fail "the scheduler honours a deliberate stop"
+# Nobody is there to answer a modal during an automatic reconnect.
+awk '/func connect\(/,/^    }/' "$SRC" | grep -q 'if auto { return }   // the scheduler restores the upstream first' \
+  && pass "an automatic connect never blocks on the no-VPN dialog" \
+  || fail "an automatic connect never blocks on the no-VPN dialog"
+# A dismissed password prompt must not be re-shown on a timer.
+awk '/func connect\(/,/^    }/' "$SRC" | grep -q 'self.reconnectPaused = true' \
+  && pass "a cancelled authorisation pauses automatic retries (no prompt storm)" \
+  || fail "a cancelled authorisation pauses automatic retries (no prompt storm)"
+grep -q 'reconnectAttempts >= reconnectMax' "$SRC" \
+  && pass "automatic retries are bounded and back off" || fail "automatic retries are bounded and back off"
+# Restarting the VPN endpoint must not override a proxy the user switched off
+# or pointed elsewhere - that is how a Belgian exit came back uninvited.
+awk '/func ourUpstreamIsDead/,/^    }/' "$SRC" | grep -q 'm.socksEnabled && m.socksPort == 1081' \
+  && pass "the upstream is only restored when the user's proxy still points at it" \
+  || fail "the upstream is only restored when the user's proxy still points at it"
+grep -q 'socksEnabled = field("SOCKSEnable") == "1"' "$SRC" \
+  && pass "a disabled system proxy is recognised as disabled, not as its last port" \
+  || fail "a disabled system proxy is recognised as disabled, not as its last port"
+# A connect that died before phase 1 left `connecting` set and play dead.
+grep -q 'connect ended without starting a tunnel' "$SRC" \
+  && pass "a connect that dies silently cannot lock the play button" \
+  || fail "a connect that dies silently cannot lock the play button"
+grep -q '"status": "fail", "msg": "No VPN endpoint is up' "$BIN/tunnel-connect.sh" \
+  && pass "connect reports an early abort to the panel instead of going quiet" \
+  || fail "connect reports an early abort to the panel instead of going quiet"
+grep -q 'if socksDetectTick % 12 == 0 { detectSocks() }' "$SRC" \
+  && pass "the proxy config is not re-forked from scutil on every poll" \
+  || fail "the proxy config is not re-forked from scutil on every poll"
+# Quitting AppTunnel is the one path that closes tunnelled apps - named first.
+awk '/func applicationShouldTerminate/,/^    }/' "$SRC" | grep -q 'tunnel-quit.sh\|quit) + " --list"' \
+  && pass "quitting AppTunnel closes the tunnelled apps, after naming them" \
+  || fail "quitting AppTunnel closes the tunnelled apps, after naming them"
 grep -qE 'index\(\$0, e\)==1 && index\(\$0, c\)>0' "$BIN/tunnel-veepn-repair.sh" 2>/dev/null \
   && pass "the repair script targets only its own core, not VeePN.app's" \
   || fail "the repair script targets only its own core, not VeePN.app's"
@@ -525,13 +571,14 @@ if printf '%s\n' "$jbody" | grep -q 'find_pids'; then
 else
   pass "join_app never uses the broad launcher sweep"
 fi
-bad_assign="$(printf '%s\n' "$jbody" | grep -c 'left=' || true)"
-good_assign="$(printf '%s\n' "$jbody" | grep -c 'left="$(main_pids_of "$exe")"' || true)"
-if [ "${bad_assign:-0}" -eq "${good_assign:-0}" ] && [ "${good_assign:-0}" -gt 0 ]; then
-  pass "every kill list in join_app comes from the requested app only ($good_assign)"
+# Superseded contract. join_app used to quit the app it was asked to add, so
+# the test checked every kill list was scoped to that one app. It now sends no
+# signal at all - closing a live session is forbidden - so the stronger
+# assertion replaces it. Comments are excluded: they describe the old behaviour.
+if printf '%s\n' "$jbody" | grep -vE '^[[:space:]]*#' | grep -qE 'kill -(TERM|KILL)|to quit'; then
+  fail "join_app never signals or quits the app it is asked to add"
 else
-  fail "every kill list in join_app comes from the requested app only" \
-       "$bad_assign assignments, only $good_assign from main_pids_of"
+  pass "join_app never signals or quits the app it is asked to add"
 fi
 
 # A liveness test built on `ps | grep -F "$exe"` matches its OWN grep process,
@@ -552,12 +599,15 @@ hits="$(ps -axo pid=,command= | awk -v e="$probe_exe" '{p=$1;$1="";sub(/^[ \t]+/
   && pass "the matcher does not match a path merely mentioned on a command line" \
   || fail "the matcher does not match a path merely mentioned on a command line"
 # A join that cannot stop the app must say so precisely, not blame the app.
-sed -n '/^join_app()/,/^}/p' "$BIN/tunnel-lock.sh" | grep -q 'could not be stopped' \
-  && pass "join failure names the pids it could not stop" \
-  || fail "join failure names the pids it could not stop"
-sed -n '/^join_app()/,/^}/p' "$BIN/tunnel-lock.sh" | grep -q 'kill -KILL' \
-  && pass "join falls back past AppleScript when Automation is denied" \
-  || fail "join falls back past AppleScript when Automation is denied"
+# An app already running outside the group cannot be moved in without a
+# restart. RUN must refuse and say so, naming the pids it left running, rather
+# than closing the app to make room.
+sed -n '/^join_app()/,/^}/p' "$BIN/tunnel-lock.sh" | grep -q 'not closing it' \
+  && pass "RUN refuses an app running outside the tunnel and names its pids" \
+  || fail "RUN refuses an app running outside the tunnel and names its pids"
+sed -n '/^join_app()/,/^}/p' "$BIN/tunnel-lock.sh" | grep -q 'Quit it yourself' \
+  && pass "RUN tells the user how to include that app themselves" \
+  || fail "RUN tells the user how to include that app themselves"
 
 # ================================================= telemetry sampler ========
 hdr "1c. Telemetry sampler"

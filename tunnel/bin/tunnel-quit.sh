@@ -33,6 +33,13 @@ names_of() {
              print s }}' | sort -u
 }
 
+# --list: name the apps that quitting would close, and change nothing. The
+# panel uses this to say exactly what it is about to close before it does.
+if [ "${1:-}" = "--list" ]; then
+  names_of
+  exit 0
+fi
+
 if [ -z "$(members)" ]; then
   sudo -n /usr/sbin/dseditgroup -o delete "$GROUP_NAME" >/dev/null 2>&1 || true
   echo "tunnel-quit: tunnel was empty; group retired"

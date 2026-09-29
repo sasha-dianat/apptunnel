@@ -1345,51 +1345,20 @@ with open(sys.argv[1],"rb") as f: print(plistlib.load(f).get("CFBundleExecutable
     return 0
   fi
 
-  # Quit only this app - and only if it is actually running.
-  left="$(main_pids_of "$exe")"
+  # Already running OUTSIDE the group: refuse, never close it.
+  #
+  # This used to quit the app (osascript, then TERM, then KILL) so it could be
+  # relaunched inside. Pressing RUN therefore destroyed a live session - the one
+  # thing this tool must never do. A gid cannot be changed after exec, so an app
+  # that is already running cannot be moved in without a restart, and whether to
+  # restart it is the user's call.
+  left="$(main_pids_of "$exe" || true)"
   if [ -n "$left" ]; then
-    log "      quitting $name (pids $(echo "$left" | tr '\n' ' ')) so it can rejoin inside the tunnel"
-    # Ask politely first so the app can save state. The error is captured, not
-    # discarded: Automation (TCC) can deny this when it comes from a root
-    # context, and silently swallowing that looked like the app refusing.
-    qerr="$(/bin/launchctl asuser "$LOGIN_UID" sudo -n -u "$LOGIN_USER" \
-             /usr/bin/osascript -e "tell application \"$name\" to quit" 2>&1)" || true
-    [ -n "$qerr" ] && log "      osascript: $(printf '%s' "$qerr" | head -1)"
-
-    i=0
-    while [ "$i" -lt 30 ]; do
-      [ -z "$(main_pids_of "$exe")" ] && break
-      sleep 0.5; i=$((i+1))
-    done
-
-    # AppleScript may be unavailable or denied; we are root, so fall back.
-    left="$(main_pids_of "$exe")"
-    if [ -n "$left" ]; then
-      log "      graceful quit did not take; sending TERM"
-      # shellcheck disable=SC2086
-      kill -TERM $left 2>/dev/null || true
-      i=0
-      while [ "$i" -lt 20 ]; do
-        [ -z "$(main_pids_of "$exe")" ] && break
-        sleep 0.5; i=$((i+1))
-      done
-    fi
-    left="$(main_pids_of "$exe")"
-    if [ -n "$left" ]; then
-      log "      still up; sending KILL"
-      # shellcheck disable=SC2086
-      kill -KILL $left 2>/dev/null || true
-      sleep 1
-    fi
-  else
-    log "      $name is not running; launching it straight into the tunnel"
-  fi
-
-  left="$(main_pids_of "$exe")"
-  if [ -n "$left" ]; then
-    emit 13 JOIN fail "$name could not be stopped (pids $(echo "$left" | tr '\n' ' ')); not moved into the tunnel"
+    log "      $name is running OUTSIDE the tunnel (pids $(echo "$left" | tr '\n' ' ')) - not closing it"
+    emit 13 JOIN fail "$name is already running outside the tunnel. Quit it yourself, then press RUN to start it inside."
     return 1
   fi
+  log "      $name is not running; launching it straight into the tunnel"
 
   set +e
   launch_app /usr/bin/env \
