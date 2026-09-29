@@ -596,33 +596,67 @@ fi
 # and this script runs under `set -euo pipefail`.
 PREFLIGHT_GID="$(/usr/bin/dscl . -read "/Groups/$GROUP_NAME" PrimaryGroupID 2>/dev/null | awk '{print $2}' || true)"
 
+# An app running OUTSIDE the group is SKIPPED, never quit.
+#
+# A process's gid is fixed at exec and cannot be changed from outside, so such
+# an app genuinely cannot be moved into the tunnel without being relaunched.
+# This used to quit it and wait - which closed live Claude and Codex sessions,
+# and when the app declined to quit (unsaved state, or because it hosts the
+# session driving this run) the wait simply ran out and the whole connect died
+# at phase 1.
+#
+# Skipping is the honest behaviour: the tunnel comes up for whatever CAN be
+# protected, the user keeps their session, and the app that was left out is
+# named loudly so nobody believes it is covered when it is not. Restarting it is
+# the user's decision, not this script's.
+KEPT_PATHS=(); KEPT_EXECS=(); KEPT_NAMES=(); SKIPPED_NAMES=()
 idx=0
 for exe in ${APP_EXECS[@]+"${APP_EXECS[@]}"}; do
   name="${APP_NAMES[$idx]}"
+  path="${APP_PATHS[$idx]}"
+  keep=1
+
+  inside=""
   if [ -n "${PREFLIGHT_GID:-}" ]; then
     inside="$(ps -axo pid=,gid=,command= | awk -v g="$PREFLIGHT_GID" -v e="$exe" '
       {p=$1; gg=$2; $1=""; $2=""; sub(/^[ \t]+/,"");
        if (gg==g && ($0==e || index($0, e " ")==1)) print p}' || true)"
-    if [ -n "$inside" ]; then
-      log "      $name is already inside the tunnel (pid $(echo "$inside" | tr '\n' ' ')); leaving it running to be adopted"
-      idx=$((idx+1))
-      continue
+  fi
+
+  if [ -n "$inside" ]; then
+    log "      $name is already inside the tunnel (pid $(echo "$inside" | tr '\n' ' ')); leaving it running to be adopted"
+  else
+    running="$(ps -axo pid=,command= | awk -v exe="$exe" '{p=$1;$1="";sub(/^[ \t]+/,"");if($0==exe||index($0,exe" ")==1)print p}' || true)"
+    if [ -n "$running" ]; then
+      log "      $name is running OUTSIDE the tunnel (pid $(echo "$running" | tr '\n' ' ')) - NOT tunnelled, and NOT closed"
+      SKIPPED_NAMES+=("$name")
+      keep=0
     fi
   fi
-  running="$(ps -axo pid=,command= | awk -v exe="$exe" '{p=$1;$1="";sub(/^[ \t]+/,"");if($0==exe||index($0,exe" ")==1)print p}')"
-  if [ -n "$running" ]; then
-    log "      $name is running OUTSIDE the tunnel; asking it to quit so it can be moved in"
-    /usr/bin/osascript -e "tell application \"$name\" to quit" >/dev/null 2>&1 || true
-    i=0
-    while [ "$i" -lt 50 ]; do
-      running="$(ps -axo pid=,command= | awk -v exe="$exe" '{p=$1;$1="";sub(/^[ \t]+/,"");if($0==exe||index($0,exe" ")==1)print p}')"
-      [ -z "$running" ] && break
-      sleep 0.2; i=$((i+1))
-    done
-    [ -z "$running" ] || die "$name did not quit. Quit or force-quit it, then rerun."
+
+  if [ "$keep" -eq 1 ]; then
+    KEPT_PATHS+=("$path"); KEPT_EXECS+=("$exe"); KEPT_NAMES+=("$name")
   fi
   idx=$((idx+1))
 done
+
+APP_PATHS=(${KEPT_PATHS[@]+"${KEPT_PATHS[@]}"})
+APP_EXECS=(${KEPT_EXECS[@]+"${KEPT_EXECS[@]}"})
+APP_NAMES=(${KEPT_NAMES[@]+"${KEPT_NAMES[@]}"})
+
+if [ "${#SKIPPED_NAMES[@]}" -gt 0 ]; then
+  log ""
+  log "      NOT PROTECTED: ${SKIPPED_NAMES[*]}"
+  log "      Each is already running outside the tunnel. A process cannot be moved"
+  log "      into the isolation group once started, so protecting it means quitting"
+  log "      and relaunching it - which this will not do to a live session."
+  log "      Quit it yourself and press play again to include it."
+  log ""
+fi
+
+if [ "$SELF_TEST" -eq 0 ] && [ "${#APP_PATHS[@]}" -eq 0 ]; then
+  die "Every selected app is already running outside the tunnel, so nothing can be protected without closing something. Quit ${SKIPPED_NAMES[*]} yourself, then press play again."
+fi
 if [ "$SELF_TEST" -eq 1 ]; then
   phase_ok "self-test mode: no apps will be launched"
 else

@@ -219,12 +219,24 @@ fi
 # reconnect closed Claude and Codex before the adoption logic in phase 10 could
 # ever see them - nothing was left in the group by then. Three teardown paths
 # were fixed while this one, on the CONNECT side, kept doing it.
-if awk '/^# Every selected app must be fully quit/,/^done$/' "$BIN/tunnel-lock.sh" \
-     | grep -q 'PREFLIGHT_GID'; then
+if grep -q 'PREFLIGHT_GID' "$BIN/tunnel-lock.sh"; then
   pass "preflight leaves apps already inside the tunnel alone"
 else
   fail "preflight leaves apps already inside the tunnel alone"
 fi
+# Preflight quit an app running outside the group and waited for it to die. That
+# closed live sessions, and when the app declined (unsaved state, or because it
+# hosts the session driving the run) the wait ran out and connect died at phase
+# 1. A gid cannot be changed after exec, so such an app is skipped and named.
+if awk '/^# An app running OUTSIDE the group is SKIPPED/,/^fi$/' "$BIN/tunnel-lock.sh" \
+     | grep -q 'osascript'; then
+  fail "preflight never quits an app to move it into the tunnel"
+else
+  pass "preflight never quits an app to move it into the tunnel"
+fi
+grep -q 'NOT PROTECTED:' "$BIN/tunnel-lock.sh" \
+  && pass "apps left outside the tunnel are named, not silently skipped" \
+  || fail "apps left outside the tunnel are named, not silently skipped"
 
 # Stop leaves apps running so they can re-adopt; quitting AppTunnel is the one
 # action that closes them.
