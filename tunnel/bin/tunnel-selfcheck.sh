@@ -407,6 +407,32 @@ grep -q 'if socksDetectTick % 12 == 0 { detectSocks() }' "$SRC" \
 awk '/func applicationShouldTerminate/,/^    }/' "$SRC" | grep -q 'tunnel-quit.sh\|quit) + " --list"' \
   && pass "quitting AppTunnel closes the tunnelled apps, after naming them" \
   || fail "quitting AppTunnel closes the tunnelled apps, after naming them"
+
+# ---- a dead connect must never look alive ----------------------------------
+# The launcher died mid-phase-5 and wrote only TEARDOWN; the panel ignored it,
+# so the phase stayed amber and `connecting` stayed set. The app replays the
+# event file on launch, so it came back stuck every day, with play refusing a
+# second connect and stop having nothing left to stop.
+awk '/private func consumeEvents/,/^    }/' "$SRC" | grep -q 'if name == "TEARDOWN" && !sessionActive && connecting' \
+  && pass "a teardown without READY ends the connect and fails its running phase" \
+  || fail "a teardown without READY ends the connect and fails its running phase"
+if grep -q 'if connecting, !sessionActive, let d = dispatchedAt' "$SRC"; then
+  fail "the watchdog also clears a dead connect replayed from disk on launch"
+else
+  pass "the watchdog also clears a dead connect replayed from disk on launch"
+fi
+grep -q '!(isTeardown && failed)' "$SRC" \
+  && pass "the failure reason is not overwritten by the teardown message" \
+  || fail "the failure reason is not overwritten by the teardown message"
+# Phase 5 died silently: bare dseditgroup under set -e.
+if grep -vE '^[[:space:]]*#' "$BIN/tunnel-lock.sh" | grep -qE '^\s*sudo /usr/sbin/dseditgroup -o (create|edit)'; then
+  fail "group setup failures stop with dseditgroup's own words, not silently"
+else
+  pass "group setup failures stop with dseditgroup's own words, not silently"
+fi
+grep -q '\[ "$gname" = "$GROUP_NAME" \] && continue' "$BIN/tunnel-lock.sh" \
+  && pass "the persistent group is never retired, so phase 5 rarely recreates it" \
+  || fail "the persistent group is never retired, so phase 5 rarely recreates it"
 grep -qE 'index\(\$0, e\)==1 && index\(\$0, c\)>0' "$BIN/tunnel-veepn-repair.sh" 2>/dev/null \
   && pass "the repair script targets only its own core, not VeePN.app's" \
   || fail "the repair script targets only its own core, not VeePN.app's"

@@ -208,6 +208,10 @@ retire_orphaned_state() {
     gname="$(printf '%s\n' "$line" | awk '{print $1}')"
     ggid="$(printf '%s\n' "$line" | awk '{print $2}')"
     case "$gname" in apptun*|cldesk*|cgptvpn*) ;; *) continue ;; esac
+    # The fixed group is persistent by design. Deleting it whenever it was
+    # empty forced every following connect down the create path - the one
+    # that has failed at phase 5 - to recreate the very same group by name.
+    [ "$gname" = "$GROUP_NAME" ] && continue
     users="$(ps -axo gid= 2>/dev/null | awk -v g="$ggid" '$1==g{n++}END{print n+0}')"
     if [ "${users:-0}" -eq 0 ]; then
       log "      retiring orphaned isolation group $gname (gid=$ggid)"
@@ -924,6 +928,20 @@ retire_orphaned_state
 # --------------------------------------------------------------- phase 5 ---
 phase 5 GROUP "creating temporary isolation group"
 
+# dseditgroup against the LOCAL node, failing with its own words.
+#
+# These calls ran bare under `set -euo pipefail`, so when one failed the
+# launcher died with no message at all - the panel showed phase 5 forever and
+# the log said only "getNodeRef failed to obtain a node reference". `-n .` names
+# the local node explicitly instead of relying on the default search path, and
+# `sudo -n` can never block waiting for a password nobody will type.
+ds_group() {
+  local out
+  if ! out="$(sudo -n /usr/sbin/dseditgroup "$@" 2>&1)"; then
+    die "Could not set up the isolation group. dseditgroup $* said: ${out:-nothing}. Run tunnel-doctor.sh, then try again."
+  fi
+}
+
 # Reuse the group if it is already there: its members are the apps that survived
 # the last disconnect, and they are only still reachable because their gid has
 # not changed. Never silently pick a different gid - an app cannot follow one.
@@ -939,10 +957,10 @@ else
   if /usr/bin/dscl . -search /Groups PrimaryGroupID "$GROUP_GID" 2>/dev/null | grep -q .; then
     die "gid $GROUP_GID is held by another group, so the isolation group cannot be created. Free it, or run tunnel-doctor.sh --fix."
   fi
-  sudo /usr/sbin/dseditgroup -o create -i "$GROUP_GID" "$GROUP_NAME" >/dev/null
+  ds_group -o create -n . -i "$GROUP_GID" "$GROUP_NAME"
   GROUP_CREATED=1
 fi
-sudo /usr/sbin/dseditgroup -o edit -a "$LOGIN_USER" -t user "$GROUP_NAME" >/dev/null
+ds_group -o edit -n . -a "$LOGIN_USER" -t user "$GROUP_NAME"
 probe_gid="$(sudo -n -u "$LOGIN_USER" -g "$GROUP_NAME" /usr/bin/id -g 2>/dev/null || true)"
 [ "$probe_gid" = "$GROUP_GID" ] || die "Could not establish effective-group isolation."
 phase_ok "group $GROUP_NAME (gid=$GROUP_GID)"

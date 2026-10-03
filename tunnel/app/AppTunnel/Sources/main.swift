@@ -173,8 +173,8 @@ final class Model {
         // launcher killed outright - may write no failure event. `connecting`
         // then never cleared, and since play refuses to start a second
         // connect, the button stayed dead until the app was restarted.
-        if connecting, !sessionActive, let d = dispatchedAt,
-           Date().timeIntervalSince(max(d, lastEventAt)) > 45 {
+        if connecting, !sessionActive,
+           Date().timeIntervalSince(max(dispatchedAt ?? .distantPast, lastEventAt)) > 45 {
             connecting = false; dispatchedAt = nil
             lastMessage = "connect ended without starting a tunnel - see the log"
             dirty = true
@@ -295,7 +295,10 @@ final class Model {
                   let name = o["name"] as? String,
                   let st = o["status"] as? String else { continue }
             let msg = (o["msg"] as? String) ?? ""
-            if !msg.isEmpty { lastMessage = msg }
+            // Teardown's "system state restored" must not bury the reason a
+            // connect failed - that reason is what the user needs to read.
+            let isTeardown = name == "TEARDOWN" || name == "CLEANUP" || name == "STOPPING"
+            if !msg.isEmpty && !(isTeardown && failed) { lastMessage = msg }
             if name == "READY" {
                 for i in phases.indices { phases[i] = .ok }
                 currentPhase = nil; connecting = false
@@ -307,6 +310,20 @@ final class Model {
             }
             if name == "TEARDOWN" || name == "CLEANUP" || name == "STOPPING" {
                 if st == "fail" { lastMessage = msg }
+                // The launcher is exiting. Without a READY first, the connect
+                // is over and the phase that was running did not finish. This
+                // used to be ignored, so a launcher that died mid-phase left
+                // that phase amber and `connecting` set FOREVER - and because
+                // the app replays this file on every launch, it came back
+                // stuck each time, with play refusing to start a second
+                // connect and stop having nothing left to stop.
+                if name == "TEARDOWN" && !sessionActive && connecting {
+                    if let i = currentPhase, phases[i] == .running {
+                        phases[i] = .failed
+                        lastMessage = "connect failed at \(PHASES[i].name) - see the log (◄◄ CHECK)"
+                    }
+                    connecting = false
+                }
                 continue
             }
             guard let i = PHASES.firstIndex(where: { $0.name == name }) else { continue }
@@ -1174,6 +1191,7 @@ final class Main: NSWindow {
         try? FileManager.default.removeItem(atPath: m.stopFile)
         m.resetPhases(); m.demoMode = false; m.connecting = true
         m.userStopped = false
+        m.lastEventAt = Date()
         m.startedAt = Date(); m.lastMessage = "authorising…"
         refresh()
 
@@ -1182,8 +1200,22 @@ final class Main: NSWindow {
         for a in apps { cmd += " --app " + Runner.q(a.path) }
         cmd += " --yes"
         let log = m.logFile
-        withBusy(auto ? "reconnecting - authorising…" : "authorising…",
-                 { Runner.adminDetached(cmd, log: log) }) { ok, out in
+        // With the privileged helper installed and current, the tunnel is rebuilt
+        // with no password prompt - which is what makes an unattended reconnect
+        // possible. Without it, macOS asks as before.
+        let helperCmd = helperCommand(apps)
+        let work: () -> (Bool, String)
+        if let hc = helperCmd {
+            work = { Runner.user("( " + hc + " ) >/dev/null 2>&1 & echo detached") }
+        } else {
+            work = { Runner.adminDetached(cmd, log: log) }
+            if auto {
+                m.lastMessage = "reconnecting - macOS will ask for your password (tunnel-install-helper.sh removes this)"
+                refresh()
+            }
+        }
+        withBusy(helperCmd != nil ? "reconnecting…" : (auto ? "reconnecting - authorising…" : "authorising…"),
+                 work) { ok, out in
             if !ok {
                 m.connecting = false
                 let cancelled = out.contains("-128")
@@ -1204,6 +1236,29 @@ final class Main: NSWindow {
                 self.refresh()
             }
         }
+    }
+
+    /// The password-free path, if it is installed and safe to use.
+    ///
+    /// Used only when every root-owned copy in the helper is byte-identical to
+    /// the script in this folder: after an update, a stale helper would have
+    /// root run code that no longer matches what the user is looking at, so
+    /// the app falls back to asking until the installer is re-run. The login
+    /// user is never passed - the helper takes it from sudo itself.
+    private func helperCommand(_ apps: [RosterApp]) -> String? {
+        let dst = "/Library/PrivilegedHelperTools/apptunnel"
+        let helper = dst + "/apptunnel-reconnect"
+        let fm = FileManager.default
+        guard fm.isExecutableFile(atPath: helper) else { return nil }
+        for f in ["apptunnel-reconnect", "tunnel-connect.sh", "tunnel-lock.sh",
+                  "tunnel-python.sh", "tunnel-telemetry.sh"] {
+            guard fm.contentsEqual(atPath: script(f), andPath: dst + "/" + f) else { return nil }
+        }
+        // -n: never prompt. Fails cleanly when the sudoers rule is absent.
+        guard Runner.user("/usr/bin/sudo -n -l " + Runner.q(helper) + " >/dev/null 2>&1").ok else { return nil }
+        var c = "/usr/bin/sudo -n " + Runner.q(helper)
+        for a in apps { c += " --app " + Runner.q(a.path) }
+        return c
     }
 
     // MARK: auto-reconnect
