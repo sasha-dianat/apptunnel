@@ -61,6 +61,34 @@ final class Model {
     /// Set by the stop button, cleared by play. A drop the user asked for must
     /// never be "repaired" behind their back.
     var userStopped = false
+
+    /// Follow VeePN: route the system through VeePN's own core while VeePN is
+    /// connected. On unless switched off.
+    var followVeePN: Bool {
+        get { UserDefaults.standard.object(forKey: "followVeePN") == nil ? true
+              : UserDefaults.standard.bool(forKey: "followVeePN") }
+        set { UserDefaults.standard.set(newValue, forKey: "followVeePN") }
+    }
+
+    /// Is anything accepting connections on 127.0.0.1:port right now?
+    /// Immediate either way on loopback; no subprocess.
+    static func loopbackListening(_ port: UInt16) -> Bool {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = port.bigEndian
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        var tv = timeval(tv_sec: 0, tv_usec: 150_000)
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        return withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        } == 0
+    }
     /// When the launcher last wrote an event, and when a connect was handed to
     /// it - together they reveal a connect that died without saying so.
     var lastEventAt = Date.distantPast
@@ -846,6 +874,7 @@ final class Main: NSWindow {
     private var logWindows: [LogWindow] = []
     private var busy = false
     private let autoBox = NSButton(checkboxWithTitle: "AUTO-RECONNECT", target: nil, action: nil)
+    private let followBox = NSButton(checkboxWithTitle: "FOLLOW VEEPN", target: nil, action: nil)
 
     init() {
         // 662, not 556: the button row is laid out left to right and already
@@ -872,6 +901,7 @@ final class Main: NSWindow {
             Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in
                 if Model.shared.poll() { self?.refresh() }
                 self?.autoReconnectTick()
+                self?.followVeePNTick()
             }
         }
     }
@@ -1017,6 +1047,15 @@ final class Main: NSWindow {
         autoBox.action = #selector(toggleAutoReconnect)
         autoBox.toolTip = "Reconnect by itself when the tunnel drops (the amber bar). Tunnelled apps are never closed; they are re-attached to the new tunnel. If VeePN's endpoint was the one in use and it died, it is restarted first. Rebuilding the tunnel needs administrator rights, so macOS may ask for your password unless you authorised within the last few minutes."
         root.addSubview(autoBox)
+
+        followBox.attributedTitle = NSAttributedString(string: "FOLLOW VEEPN",
+            attributes: [.font: Skin.mono(9, true), .foregroundColor: Skin.label])
+        followBox.frame = NSRect(x: W - 262, y: y - 2, width: 116, height: 18)
+        followBox.state = Model.shared.followVeePN ? .on : .off
+        followBox.target = self
+        followBox.action = #selector(toggleFollowVeePN)
+        followBox.toolTip = "While VeePN is connected, route the whole Mac through VeePN's own connection, and put your previous proxy back when VeePN disconnects. VeePN cannot do this itself here: its privileged helper is not installed, so it reports 'connected' while the system never uses it. A server that VeePN calls connected but that passes no traffic is detected and left alone."
+        root.addSubview(followBox)
 
         y -= 116
         bars.frame = NSRect(x: 8, y: y, width: W - 16, height: 112)
@@ -1259,6 +1298,146 @@ final class Main: NSWindow {
         var c = "/usr/bin/sudo -n " + Runner.q(helper)
         for a in apps { c += " --app " + Runner.q(a.path) }
         return c
+    }
+
+    // MARK: follow VeePN
+
+    // VeePN's Shadowsocks mode starts its own core, then asks a privileged
+    // helper to switch the system proxy. That helper is not installed here -
+    // "Blesser: Helper State: absent" on every connect for days - so VeePN
+    // reports "running" while the Mac never uses it. This performs that one
+    // missing step, which also makes VeePN's own location picker and its own
+    // Disconnect button behave as they should.
+    private var followTick = 0
+    private var vendorUp = false
+    private var vendorChecked = false      // this up-period has been verified or rejected
+    private var vendorDownSince: Date? = nil
+    private var followVerifying = false
+    private let followStateFile = NSHomeDirectory() + "/.apptunnel/follow.json"
+    private let followService = "Wi-Fi"
+
+    @objc func toggleFollowVeePN() {
+        let m = Model.shared
+        m.followVeePN = followBox.state == .on
+        vendorChecked = false
+        m.lastMessage = m.followVeePN ? "following VeePN" : "not following VeePN"
+        refresh()
+    }
+
+    /// The SOCKS port VeePN's core listens on, read from the config VeePN
+    /// writes on every connect. Its port iterator can move it off 1080.
+    private func vendorPort() -> UInt16? {
+        let f = NSHomeDirectory() + "/Library/Application Support/com.veepn.macos.direct/shadowsocks.json"
+        guard let d = FileManager.default.contents(atPath: f),
+              let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+              let ins = o["inbounds"] as? [[String: Any]] else { return nil }
+        for i in ins where (i["protocol"] as? String) == "socks" {
+            if let p = i["port"] as? Int { return UInt16(exactly: p) }
+            if let t = i["port"] as? String, let p = UInt16(t) { return p }
+        }
+        return nil
+    }
+
+    private func proxyFields() -> [String: String] {
+        var f: [String: String] = [:]
+        for line in Runner.user("/usr/sbin/scutil --proxy").out.split(separator: "\n") {
+            let parts = line.split(separator: ":", maxSplits: 1)
+            guard parts.count == 2 else { continue }
+            f[parts[0].trimmingCharacters(in: .whitespaces)] = parts[1].trimmingCharacters(in: .whitespaces)
+        }
+        return f
+    }
+
+    func followVeePNTick() {
+        let m = Model.shared
+        followTick += 1
+        guard followTick % 5 == 0 else { return }               // about every 2s
+        guard let port = vendorPort(), port != 1081, port != 1091 else { return }
+        let followed = FileManager.default.fileExists(atPath: followStateFile)
+
+        if Model.loopbackListening(port) {
+            vendorDownSince = nil
+            guard !vendorUp || !vendorChecked else { return }
+            vendorUp = true
+            guard m.followVeePN, !followVerifying, !m.veepnUp else { vendorChecked = true; return }
+            followVerifying = true
+            m.lastMessage = "VeePN connected - checking that its server passes traffic…"
+            refresh()
+            DispatchQueue.global(qos: .utility).async {
+                // A real request through VeePN's core. VeePN calls some servers
+                // "connected" while they pass nothing from this network.
+                let r = Runner.user("/usr/bin/curl -s --max-time 15 --socks5-hostname 127.0.0.1:\(port) https://api.ipify.org")
+                let ip = r.out.trimmingCharacters(in: .whitespacesAndNewlines)
+                DispatchQueue.main.async {
+                    self.followVerifying = false
+                    self.vendorChecked = true
+                    let looksLikeIP = !ip.isEmpty && ip.count <= 45 && !ip.contains(" ")
+                    if r.ok && looksLikeIP {
+                        self.takeOverProxy(port: port, exitIP: ip)
+                    } else {
+                        m.lastMessage = "VeePN says connected, but this server passes no traffic from your network. Pick another location (Belgium works). Your proxy was left as it was."
+                        self.refresh()
+                    }
+                }
+            }
+            return
+        }
+
+        // Down. Ride out a server switch (VeePN stops, then starts again).
+        guard vendorUp || followed else { return }
+        if vendorDownSince == nil { vendorDownSince = Date(); return }
+        guard Date().timeIntervalSince(vendorDownSince!) > 3 else { return }
+        vendorUp = false; vendorChecked = false; vendorDownSince = nil
+        if followed { restoreProxyAfterFollow(port: port) }
+    }
+
+    private func takeOverProxy(port: UInt16, exitIP: String) {
+        let m = Model.shared
+        // Remember what was there - once - so it can be put back exactly.
+        if !FileManager.default.fileExists(atPath: followStateFile) {
+            let f = proxyFields()
+            var keep: [String: String] = [:]
+            for k in ["HTTPEnable", "HTTPProxy", "HTTPPort", "HTTPSEnable", "HTTPSProxy", "HTTPSPort",
+                      "SOCKSEnable", "SOCKSProxy", "SOCKSPort"] { keep[k] = f[k] }
+            if let d = try? JSONSerialization.data(withJSONObject: keep) {
+                FileManager.default.createFile(atPath: followStateFile, contents: d)
+            }
+        }
+        // VeePN's core offers SOCKS only. HTTP proxies are switched off rather
+        // than left pointing elsewhere, because browsers prefer them over SOCKS
+        // and traffic would never reach VeePN.
+        let s = Runner.q(followService)
+        _ = Runner.user("/usr/sbin/networksetup -setwebproxystate \(s) off; "
+                      + "/usr/sbin/networksetup -setsecurewebproxystate \(s) off; "
+                      + "/usr/sbin/networksetup -setsocksfirewallproxy \(s) 127.0.0.1 \(port)")
+        m.lastMessage = "Following VeePN - the whole Mac now exits at \(exitIP)"
+        refresh()
+    }
+
+    private func restoreProxyAfterFollow(port: UInt16) {
+        let m = Model.shared
+        defer { try? FileManager.default.removeItem(atPath: followStateFile) }
+        guard let d = FileManager.default.contents(atPath: followStateFile),
+              let prev = try? JSONSerialization.jsonObject(with: d) as? [String: String] else { return }
+        // Undo only our own change. If the proxy was pointed somewhere else in
+        // the meantime - VPN START, Hiddify, by hand - that was deliberate.
+        let now = proxyFields()
+        guard now["SOCKSEnable"] == "1", now["SOCKSPort"] == String(port) else { return }
+        let s = Runner.q(followService)
+        var cmd = ""
+        func one(_ k: String, _ set: String, _ state: String) {
+            if prev[k + "Enable"] == "1", let h = prev[k + "Proxy"], let p = prev[k + "Port"], UInt16(p) != nil {
+                cmd += "/usr/sbin/networksetup \(set) \(s) \(Runner.q(h)) \(p); "
+            } else {
+                cmd += "/usr/sbin/networksetup \(state) \(s) off; "
+            }
+        }
+        one("HTTP", "-setwebproxy", "-setwebproxystate")
+        one("HTTPS", "-setsecurewebproxy", "-setsecurewebproxystate")
+        one("SOCKS", "-setsocksfirewallproxy", "-setsocksfirewallproxystate")
+        _ = Runner.user(cmd)
+        m.lastMessage = "VeePN disconnected - your previous proxy is back"
+        refresh()
     }
 
     // MARK: auto-reconnect

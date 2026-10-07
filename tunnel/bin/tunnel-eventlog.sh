@@ -128,7 +128,12 @@ LAST_LISTENING=""
 LAST_ROUTE=""
 
 snapshot() {
-  take_ps
+  # The process table is the expensive part: `ps -ax` over ~730 processes costs
+  # about 0.24s whichever columns are asked for, which put the sampler at 6-7%
+  # of a core. What it yields - group size, launcher, which VPN apps run - moves
+  # slowly; the first signs of a disconnection (proxy, route, ports) are cheap
+  # and still sampled every tick. So the table is re-read every third tick.
+  if [ $(( TICK % 3 )) -eq 0 ] || [ ! -s "$PSFILE" ]; then take_ps; fi
   declare_listening
   rt="$(default_route)"
 

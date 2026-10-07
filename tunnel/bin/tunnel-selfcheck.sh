@@ -408,6 +408,35 @@ awk '/func applicationShouldTerminate/,/^    }/' "$SRC" | grep -q 'tunnel-quit.s
   && pass "quitting AppTunnel closes the tunnelled apps, after naming them" \
   || fail "quitting AppTunnel closes the tunnelled apps, after naming them"
 
+# ---- follow VeePN: do the step VeePN's missing helper cannot ----------------
+# VeePN starts its own core then asks an absent privileged helper to move the
+# system proxy, so the Mac never used VeePN unless VPN START was pressed.
+grep -q 'func followVeePNTick' "$SRC" && grep -q 'self?.followVeePNTick()' "$SRC" \
+  && pass "the panel follows VeePN's own connection" || fail "the panel follows VeePN's own connection"
+grep -q 'NSButton(checkboxWithTitle: "FOLLOW VEEPN"' "$SRC" \
+  && pass "following VeePN can be switched off" || fail "following VeePN can be switched off"
+# VeePN reports some servers "connected" while they pass nothing; switching the
+# Mac onto one would take its internet away.
+awk '/func followVeePNTick/,/^    }/' "$SRC" | grep -q 'socks5-hostname 127.0.0.1' \
+  && pass "a VeePN server is proven to pass traffic before the Mac is switched onto it" \
+  || fail "a VeePN server is proven to pass traffic before the Mac is switched onto it"
+awk '/func takeOverProxy/,/^    }/' "$SRC" | grep -q 'followStateFile' \
+  && pass "the previous proxy is saved before it is replaced" \
+  || fail "the previous proxy is saved before it is replaced"
+# Undo only our own change; anything pointed elsewhere since was deliberate.
+awk '/func restoreProxyAfterFollow/,/^    }/' "$SRC" | grep -q 'now\["SOCKSPort"\] == String(port)' \
+  && pass "restoring only undoes AppTunnel's own change" \
+  || fail "restoring only undoes AppTunnel's own change"
+# Browsers prefer HTTP proxies over SOCKS; leaving Hiddify's in place meant
+# traffic never reached VeePN.
+awk '/func takeOverProxy/,/^    }/' "$SRC" | grep -q 'setwebproxystate' \
+  && pass "HTTP proxies are switched off so traffic actually reaches VeePN" \
+  || fail "HTTP proxies are switched off so traffic actually reaches VeePN"
+# A server switch is stop-then-start; restoring on every blip would flap.
+awk '/func followVeePNTick/,/^    }/' "$SRC" | grep -q 'timeIntervalSince(vendorDownSince!) > 3' \
+  && pass "a VeePN server switch does not flap the system proxy" \
+  || fail "a VeePN server switch does not flap the system proxy"
+
 # ---- a dead connect must never look alive ----------------------------------
 # The launcher died mid-phase-5 and wrote only TEARDOWN; the panel ignored it,
 # so the phase stayed amber and `connecting` stayed set. The app replays the
@@ -454,7 +483,15 @@ grep -q 'stop_who=' "$BIN/tunnel-lock.sh" \
 # and would overstate the daemon's real cost. What matters is CPU per second of
 # wall clock, which is what burned 41% of a core.
 _duty="$("$BIN/tunnel-eventlog.sh" bench 8 2>/dev/null | awk '/duty cycle/{gsub("%","",$4); print $4}')"
-if awk -v d="$_duty" 'BEGIN{exit !(d+0 > 0 && d+0 < 5.0)}' 2>/dev/null; then
+# Each sample is mostly the cost of forking ps, scutil and netstat, which
+# stretches when the machine is busy: the same code measured 2.6% idle and 7%
+# at a load average of 6-9. A timing assertion that fails whenever the Mac is
+# busy is a flaky test, so it only runs when there is CPU to spare.
+_load="$(sysctl -n vm.loadavg 2>/dev/null | awk '{print $2}')"
+_cpus="$(sysctl -n hw.ncpu 2>/dev/null)"
+if awk -v l="${_load:-0}" -v c="${_cpus:-1}" 'BEGIN{exit !(l+0 > c+0)}'; then
+  skip "sampler cost not measured: load ${_load} exceeds ${_cpus} cores (measured ${_duty}%)"
+elif awk -v d="$_duty" 'BEGIN{exit !(d+0 > 0 && d+0 < 5.0)}' 2>/dev/null; then
   pass "the sampler costs under 5% of a core (measured ${_duty}%)"
 else
   fail "the sampler costs under 5% of a core (measured ${_duty:-unknown}%)"
