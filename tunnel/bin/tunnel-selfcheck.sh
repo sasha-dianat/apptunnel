@@ -408,6 +408,24 @@ awk '/func applicationShouldTerminate/,/^    }/' "$SRC" | grep -q 'tunnel-quit.s
   && pass "quitting AppTunnel closes the tunnelled apps, after naming them" \
   || fail "quitting AppTunnel closes the tunnelled apps, after naming them"
 
+# ---- a dead or absent tunnel must not trigger reconnects -------------------
+# Auto-reconnect retried eight times - silently, as root through the helper -
+# against apps running OUTSIDE the tunnel that it would never close. With
+# nobody inside the group there is nothing to re-attach.
+awk '/func autoReconnectTick/,/^    }/' "$SRC" | grep -q 'tunnelMemberCount() == 0' \
+  && pass "auto-reconnect only fires when apps are waiting inside the tunnel" \
+  || fail "auto-reconnect only fires when apps are waiting inside the tunnel"
+# A force-killed launcher leaves session.json behind and pids are reused, so
+# "the pid is alive" made a dead tunnel look alive, then look like a drop.
+awk '/private func readSession/,/^    }/' "$SRC" | grep -q 'guard isLauncher(pid)' \
+  && pass "the panel only believes a session whose pid is really a launcher" \
+  || fail "the panel only believes a session whose pid is really a launcher"
+# The launcher's own lock had the same weakness: a reused pid made every
+# later connect refuse with "another session is already running".
+sed -n '/^def claim():/,/^esac/p' "$BIN/tunnel-lock.sh" | grep -q '"tunnel-lock.sh" not in cmd' \
+  && pass "the session lock ignores a stale file whose pid was reused" \
+  || fail "the session lock ignores a stale file whose pid was reused"
+
 # ---- follow VeePN: do the step VeePN's missing helper cannot ----------------
 # VeePN starts its own core then asks an absent privileged helper to move the
 # system proxy, so the Mac never used VeePN unless VPN START was pressed.
@@ -807,12 +825,25 @@ else
   # The helper's stdout MUST be redirected: a background job that inherits the
   # script's stdout keeps the pipe open, so `selfcheck | sed` would block until
   # the sleep expired. That is what made this suite appear to hang.
-  sleep 20 >/dev/null 2>&1 & live=$!
+  # The owner must look like a launcher: the lock only respects a pid whose
+  # command line is tunnel-lock.sh, because pids are reused.
+  bash -c 'exec -a "/bin/bash tunnel-lock.sh" sleep 20' >/dev/null 2>&1 & live=$!
+  sleep 0.3
   "$PY" -c 'import json,sys;json.dump({"pid":int(sys.argv[2]),"state":"test"},open(sys.argv[1],"w"))' \
     "$STATE_DIR/session.json" "$live"
   out="$("$BIN/tunnel-lock.sh" --self-test --socks-port 9 2>&1)"
   assert_contains "a live lock blocks a second run" "already running" "$out"
   kill "$live" 2>/dev/null; wait "$live" 2>/dev/null
+  rm -f "$STATE_DIR/session.json"
+
+  # ...but a live pid that is NOT a launcher is a stale lock with a reused pid,
+  # and must not block a real connect with "already running".
+  sleep 20 >/dev/null 2>&1 & other=$!
+  "$PY" -c 'import json,sys;json.dump({"pid":int(sys.argv[2]),"state":"test"},open(sys.argv[1],"w"))' \
+    "$STATE_DIR/session.json" "$other"
+  out="$("$BIN/tunnel-lock.sh" --self-test --socks-port 9 2>&1)"
+  assert_not_contains "a stale lock whose pid was reused does not block" "already running" "$out"
+  kill "$other" 2>/dev/null; wait "$other" 2>/dev/null
   rm -f "$STATE_DIR/session.json"
 fi
 

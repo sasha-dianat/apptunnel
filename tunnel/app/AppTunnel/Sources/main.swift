@@ -261,9 +261,25 @@ final class Model {
               let pid = o["pid"] as? Int else { return false }
         // The launcher may be root-owned: EPERM still proves it is alive.
         if kill(pid_t(pid), 0) != 0 && errno != EPERM { return false }
+        // Alive is not enough. A launcher killed outright leaves session.json
+        // behind, macOS reuses pids, and an unrelated process holding that pid
+        // made a dead tunnel look alive - then look like a DROP the moment that
+        // process exited, sending auto-reconnect into repeated attempts.
+        guard isLauncher(pid) else { return false }
         if let ip = o["exit_ip"] as? String { exitIP = ip }
         if let g = o["gid"] as? Int { gid = String(g) }
         return (o["state"] as? String) != "starting"
+    }
+
+    /// Whether `pid` is really a tunnel launcher. Asked once per pid and
+    /// cached, because this runs on every poll.
+    private var launcherPidChecked: (pid: Int, ok: Bool)? = nil
+    private func isLauncher(_ pid: Int) -> Bool {
+        if let c = launcherPidChecked, c.pid == pid { return c.ok }
+        let out = Runner.user("/bin/ps -p \(pid) -o command=").out
+        let ok = out.contains("tunnel-lock.sh")
+        launcherPidChecked = (pid, ok)
+        return ok
     }
 
     /// Read the SOCKS endpoint the VPN advertises to the system.
@@ -1479,6 +1495,16 @@ final class Main: NSWindow {
         }
     }
 
+    /// Processes inside the isolation group, i.e. apps a reconnect would
+    /// re-attach. Only asked when a reconnect is about to be scheduled.
+    private func tunnelMemberCount() -> Int {
+        guard let g = getgrnam("apptunnel") else { return 0 }
+        let gid = g.pointee.gr_gid
+        let out = Runner.user("/bin/ps -axo gid=").out
+        return out.split(separator: "\n").filter {
+            UInt32($0.trimmingCharacters(in: .whitespaces)) == gid }.count
+    }
+
     /// Runs on every poll. Cheap when there is nothing to do.
     func autoReconnectTick() {
         let m = Model.shared
@@ -1495,6 +1521,16 @@ final class Main: NSWindow {
         }
         guard m.autoReconnect, wasActive, !m.userStopped, !reconnectPaused,
               !m.connecting, !busy else { return }
+
+        // Reconnecting exists to re-attach apps still waiting inside the
+        // tunnel. With nobody inside there is nothing to restore, and a connect
+        // can only fail - it was retried eight times, silently and as root,
+        // against apps running outside the tunnel that it would never close.
+        if reconnectAt == nil && tunnelMemberCount() == 0 {
+            wasActive = false
+            m.lastMessage = "tunnel dropped - nothing was left inside it, so there is nothing to reconnect"
+            refresh(); return
+        }
 
         let now = Date()
         guard let due = reconnectAt else {

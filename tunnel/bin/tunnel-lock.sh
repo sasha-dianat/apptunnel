@@ -529,6 +529,14 @@ except FileExistsError:
     try:
         other = json.load(open(path)).get("pid")
         os.kill(int(other), 0)
+        # Alive is not enough: pids are reused, and a launcher killed outright
+        # leaves this file behind, so an unrelated process could make every
+        # later connect refuse with "another session is already running".
+        import subprocess
+        cmd = subprocess.run(["/bin/ps", "-p", str(int(other)), "-o", "command="],
+                             capture_output=True, text=True).stdout
+        if "tunnel-lock.sh" not in cmd:
+            raise ProcessLookupError("pid %s is not a launcher" % other)
         print("BUSY %s" % other)
     except Exception:
         try: os.unlink(path)
